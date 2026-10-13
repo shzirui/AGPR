@@ -1,5 +1,0 @@
-Thought/response states the intended action; it does not prove execution.
-Screenshots before/after prove execution through visual state changes.
-Task instructions decide whether the resulting content/value/layout is correct.
-Later steps may show whether a change was useful; do not invent unseen visual details.
-If text and visuals conflict, trust visuals for execution.

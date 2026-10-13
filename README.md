@@ -1,14 +1,11 @@
 # Adaptive-Group Process Rewards for GUI Agents
 
 [![Website](https://img.shields.io/badge/Website-AGPR-2663ff)](https://shzirui.github.io/AGPR/)
-[![Paper](https://img.shields.io/badge/Paper-LaTeX-black)](paper/)
 [![Code](https://img.shields.io/badge/Code-GitHub-black)](https://github.com/shzirui/AGPR)
 
-🌐 [Website](https://shzirui.github.io/AGPR/) | 📑 [Paper](paper/) | 💻 [Code](https://github.com/shzirui/AGPR)
+🌐 [Website](https://shzirui.github.io/AGPR/) | 💻 [Code](https://github.com/shzirui/AGPR)
 
 This repository extends the [DART-GUI](https://github.com/computer-use-agents/dart-gui) training infrastructure with **adaptive-group process rewards**. A completed GUI trajectory is partitioned into subgoal groups. A critic scores each action and each group, and the resulting process rewards shape GRPO's step-level advantage.
-
-The arXiv version is not uploaded yet. The public LaTeX source is in [`paper/`](paper/). `paper/main.tex` is the author version; it is not the double-blind submission file.
 
 ## Process rewards in training
 
@@ -35,6 +32,7 @@ The pipeline follows DART-GUI: prepare containers and MySQL, start the rollout m
 For the original DART-GUI image, SQL schema, and GUI environment, see:
 
 * DART-GUI: https://github.com/computer-use-agents/dart-gui
+* GUI environment: `GUI-Docker-Env/`
 
 ### 1. Preparation
 

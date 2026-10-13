@@ -163,7 +163,6 @@ PHASE3_CONSTRAINTS = """
        - Harmful: the group followed a wrong route, produced wrong content/value/output, corrupted required state, blocked progress, or caused later groups to build on invalid state.
    - Group refinement constraints:
        - Do not hallucinate visual evidence beyond the step-level reasons and group conclusions.
-       - Do not raise a harmful or wrong-content group only because the final outcome succeeded.
        - Do not lower a correct useful group only because a later unrelated group failed.
        - If a later group depends on an invalid output from an earlier group, reflect the invalid dependency in the later group's refined contribution.
 """
@@ -450,7 +449,6 @@ def _format_phase3_group_evaluations(all_subgoals: List[Dict]) -> str:
 async def async_refine_group_judgments_single_turn(
     task_instruction: str,
     all_subgoals: List[Dict],
-    outcome_reward: float,
     async_call_llm_fn
 ) -> Optional[Dict]:
     group_evaluations = _format_phase3_group_evaluations(all_subgoals)
@@ -468,7 +466,6 @@ async def async_refine_group_judgments_single_turn(
 
     Core scoring principle:
     - Initial group conclusions provide local group judgments; cross-group evidence can validate, weaken, or invalidate them.
-    - Final outcome reward is context, not automatic proof that every group was useful or harmful.
 
     """
 
@@ -477,9 +474,6 @@ async def async_refine_group_judgments_single_turn(
         "text": f"""
 ## Global Task Instruction
 {task_instruction}
-
-## Final Outcome Reward
-{outcome_reward}
 
 ## Initial Group-Level Evaluations
 {group_evaluations}

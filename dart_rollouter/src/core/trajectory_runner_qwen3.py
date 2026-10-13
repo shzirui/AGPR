@@ -909,7 +909,6 @@ class TrajectoryRunnerActor:
             phase3_refinement = await refine_fn(
                 task_instruction=task_instruction,
                 all_subgoals=enriched_subgoals,
-                outcome_reward=outcome_reward,
                 async_call_llm_fn=call_llm_callback
             )
             if phase3_refinement:

@@ -11,16 +11,7 @@ from desktop_env.desktop_env import DesktopEnv
 from src.utils.ui_tars_utils import *
 from src.utils.log_config import setup_logging
 from src.utils.kill_all_env import stop_emulator
-from src.core.group import async_group_steps
-from src.core.group_multi import async_group_steps as async_group_steps_multi
-from src.core.score_backward_multi import async_score_recursive_step_multi_turn, async_refine_group_judgments_multi_turn
-from src.core.score_backward_single import async_score_recursive_step_single_turn, async_refine_group_judgments_single_turn
-from src.core.prm_validation import (
-    PRMValidationError,
-    derive_group_score,
-    validate_final_step_coverage,
-    validate_grouped_step_coverage,
-)
+from src.core.scoring_switch import resolve_process_reward_scoring
 from src.core.seekjudge_rl import evaluate_seekjudge_process_reward
 from copy import deepcopy
 from dotenv import load_dotenv
@@ -101,6 +92,9 @@ class TrajectoryRunnerActor:
             raise ValueError(f"Unsupported process_reward.backend: {self.pr_backend}")
         self.pr_mode = str(getattr(process_reward_cfg, "mode", "single")).lower()
         self.enable_pr_phase3 = bool(getattr(process_reward_cfg, "enable_phase3", False))
+        self.pr_scoring = resolve_process_reward_scoring(
+            getattr(process_reward_cfg, "scoring_version", "v2_1")
+        )
         # self.save_img_pt = self.runner_cfg.save_img_pt
         # self.rollout_n = self.runner_cfg.rollout_n
 
@@ -827,9 +821,10 @@ class TrajectoryRunnerActor:
 
         pr_mode = self.pr_mode
         enable_pr_phase3 = self.enable_pr_phase3
-        group_fn = async_group_steps_multi if pr_mode == "multi" else async_group_steps
-        score_fn = async_score_recursive_step_multi_turn if pr_mode == "multi" else async_score_recursive_step_single_turn
-        refine_fn = async_refine_group_judgments_multi_turn if pr_mode == "multi" else async_refine_group_judgments_single_turn
+        scoring = self.pr_scoring
+        group_fn = scoring.group_multi if pr_mode == "multi" else scoring.group_single
+        score_fn = scoring.score_multi if pr_mode == "multi" else scoring.score_single
+        refine_fn = scoring.refine_multi if pr_mode == "multi" else scoring.refine_single
 
         # 2. 构造一个能自动绑定当前模型池的 async 回调函数
         async def call_llm_callback(messages, max_tokens=4096):
@@ -848,10 +843,10 @@ class TrajectoryRunnerActor:
             return raw_pr_payload(), None
 
         try:
-            validate_grouped_step_coverage(
+            scoring.validate_grouped_step_coverage(
                 enriched_subgoals, total_steps, require_windows=(pr_mode == "multi")
             )
-        except PRMValidationError as error:
+        except scoring.errors as error:
             logger.warning(f"[{self.trace_id}] Invalid grouping structure: {error}")
             return raw_pr_payload(), None
 
@@ -885,22 +880,15 @@ class TrajectoryRunnerActor:
 
             group_conclusion = eval_res.get("current_group_conclusion", {})
             try:
-                group_score = derive_group_score(
-                    group_conclusion["subgoal_status"],
-                    group_conclusion["goal_contribution"],
-                )
-            except (KeyError, PRMValidationError) as error:
+                group_score = scoring.group_score(group_conclusion)
+            except scoring.errors as error:
                 logger.warning(f"[{self.trace_id}] Invalid Phase 2 group judgment: {error}")
                 return raw_pr_payload(), None
-	            
+
             previous_group_result_lines.append(
-                f"Group {idx + 1}:\n"
-                f"  subgoal: {enriched_subgoals[idx].get('subgoal_name', 'Unknown')}\n"
-                f"  reasoning: {enriched_subgoals[idx].get('reasoning', 'Unknown')}\n"
-                f"  score: {group_score}\n"
-                f"  summary: {group_conclusion.get('history_summary_for_next_group') or group_conclusion.get('reason', '')}\n"
-                f"  status: {group_conclusion.get('subgoal_status', 'Unknown')}\n"
-                f"  contribution: {group_conclusion.get('goal_contribution', 'Unknown')}"
+                scoring.previous_group_line(
+                    idx, enriched_subgoals[idx], group_conclusion, group_score
+                )
             )
 
         phase3_refinement = None
@@ -927,8 +915,8 @@ class TrajectoryRunnerActor:
                 return raw_pr_payload(), None
 
         try:
-            validate_final_step_coverage(enriched_subgoals, total_steps)
-        except PRMValidationError as error:
+            scoring.validate_final_step_coverage(enriched_subgoals, total_steps)
+        except scoring.errors as error:
             logger.warning(f"[{self.trace_id}] Incomplete final scoring structure: {error}")
             return raw_pr_payload(), None
 
@@ -939,11 +927,8 @@ class TrajectoryRunnerActor:
                     continue
                 try:
                     group_index = int(item.get("group_index", 0)) - 1
-                    refined_score = derive_group_score(
-                        item["refined_subgoal_status"],
-                        item["refined_goal_contribution"],
-                    )
-                except (KeyError, PRMValidationError):
+                    refined_score = scoring.refined_score(item)
+                except scoring.errors:
                     continue
                 if 0 <= group_index < len(enriched_subgoals) and refined_score >= 0:
                     refined_score_by_group[group_index] = refined_score
@@ -956,12 +941,9 @@ class TrajectoryRunnerActor:
             try:
                 group_score = refined_score_by_group.get(
                     idx,
-                    derive_group_score(
-                        group_conclusion["subgoal_status"],
-                        group_conclusion["goal_contribution"],
-                    ),
+                    scoring.group_score(group_conclusion),
                 )
-            except (KeyError, PRMValidationError):
+            except scoring.errors:
                 group_score = -1
             if group_score < 0:
                 continue
@@ -991,6 +973,7 @@ class TrajectoryRunnerActor:
             "task_id": self.task_id,
             "trace_id": self.trace_id,
             "overall_reward": outcome_reward,
+            "scoring_version": scoring.name,
             "task_instruction": task_instruction,
             "enable_pr_phase3": enable_pr_phase3,
             "phase3_refinement": phase3_refinement,

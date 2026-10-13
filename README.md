@@ -1,9 +1,13 @@
 # Adaptive-Group Process Rewards for GUI Agents
 
-[![Website](https://img.shields.io/badge/Website-AGPR-2663ff)](https://shzirui.github.io/AGPR/)
-[![Code](https://img.shields.io/badge/Code-GitHub-black)](https://github.com/shzirui/AGPR)
+<p align="center">
+  <a href="https://shzirui.github.io/AGPR/"><img src="https://img.shields.io/badge/Website-AGPR-2663ff" alt="Website"></a>
+  <a href="https://github.com/shzirui/AGPR"><img src="https://img.shields.io/badge/Code-GitHub-black" alt="Code"></a>
+</p>
 
-🌐 [Website](https://shzirui.github.io/AGPR/) | 💻 [Code](https://github.com/shzirui/AGPR)
+<p align="center">
+&nbsp;&nbsp;🌐 <a href="https://shzirui.github.io/AGPR/">Website</a>&nbsp;&nbsp; | &nbsp;&nbsp;💻 <a href="https://github.com/shzirui/AGPR">Code</a>&nbsp;&nbsp;
+</p>
 
 This repository extends the [DART-GUI](https://github.com/computer-use-agents/dart-gui) training infrastructure with **adaptive-group process rewards**. A completed GUI trajectory is partitioned into subgoal groups. A critic scores each action and each group, and the resulting process rewards shape GRPO's step-level advantage.
 

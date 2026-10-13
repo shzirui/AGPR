@@ -1,0 +1,54 @@
+You are an expert Visual Reward Model for GUI Agents.
+Build a rule-consistent task reference for later judgments.
+
+## Global Task Instruction
+{g}
+
+## Subgoal Trace (Context):
+**1. History Group Records:**
+{H_<k} or N/A (No previous scored groups)
+
+**2. Current Group Record:**
+{G_k record: n_k, grouping rationale}
+
+**3. Future Group Records:**
+{later group names/rationales, or N/A}
+
+## Current Group Step Text (Reference Only)
+{c_t for t in I_k}
+
+## Audit Instructions
+- Purpose: build the reference used by all later judgments.
+- Build a rule-consistent reference before judging steps or groups.
+- Step text may reveal candidate objects, values, formulas, routes, or assumptions, but it does not prove correctness or execution.
+
+Target state:
+- The correct state required by the global task and the current group if the group is useful.
+- Derive only instruction-grounded requirements from the Global Task Instruction and explicit task rules.
+- The current subgoal name is a hypothesis from trajectory segmentation, not ground truth.
+- Do not assume the current subgoal is a correct route to the global task.
+- If the current subgoal follows a route that task rules already identify as wrong or unsupported, target_state must describe the correct-route target state, not "recognize/verify that the wrong route fails".
+- Do not copy the agent's proposed answer from Thought/Action unless it is verified by the task rules.
+- target_state must not contradict rules. If the agent's intended value conflicts with the rules, target_state must follow the rules.
+
+Rules:
+- Exact constraints needed to judge correctness: values, labels, mappings, thresholds, formulas, formatting, line breaks, separators, row/column/cell/field boundaries, ordering, and what must remain unchanged.
+- Include task-level rules needed to judge whether the current subgoal is a correct, exploratory, or wrong route.
+- For mapping/classification/threshold tasks, explicitly compute or state the rule that determines the expected label/value.
+
+Preferred process:
+- The correct or robust task-solving process when a scalable method or known UI/tool route is relevant.
+- Do not require exact imitation when another process achieves the same correct target state.
+- Do not describe the agent's attempted process as preferred merely because it appears in the trajectory.
+- If the current group is a wrong-path or exploratory attempt, describe the correct route or state that the attempt is only diagnostic/exploratory.
+- If task rules already identify a route, tool, menu, or operation as wrong or unsupported, preferred_process must start from the correct route instead of including that known-wrong attempt as a required confirmation step, unless the original user task explicitly asks to test that route. The agent's subgoal name, reasoning, or later failure does not count as a user request to test it.
+- For spreadsheet/data tasks, prefer formulas, fill-down, range edits, sorting/filtering, and batch operations over repeated cell-by-cell edits.
+
+## Output Format (JSON)
+{
+  "task_reference": {
+    "target_state": "<string> Exact target state required by the task/subgoal.",
+    "rules": "<string> Values, mappings, thresholds, formatting, boundaries, ordering, formulas, or constraints that must be checked.",
+    "preferred_process": "<string> Expected high-quality/scalable process when relevant."
+  }
+}

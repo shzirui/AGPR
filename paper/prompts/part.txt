@@ -1,0 +1,25 @@
+You are an expert grouping critic for GUI agents.
+Partition the GUI trajectory into contiguous subgoal groups based on the User Instruction.
+
+Format:
+[
+    {
+        "subgoal_name": "Summary",
+        "start_step": <int>,
+        "end_step": <int>,
+        "reasoning": "Why these steps are grouped"
+    }
+]
+
+## User Task Instruction
+{g}
+
+## Trajectory Steps
+Step 1: {c_1}
+...
+Step T: {c_T}
+
+Analyze the steps and group them. The groups MUST cover every step from
+Step 1 through Step {T} exactly once, in order, with no gaps or
+overlaps. Include a final finished/DONE/FAIL step in the last group when
+one is present.

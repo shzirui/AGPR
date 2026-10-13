@@ -1,1 +1,0 @@
-python -m pytest -v -s tests/osworld/test_dataset.py::test_list_env

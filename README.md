@@ -32,11 +32,9 @@ Set `use_pr=none` for outcome-only GRPO. `pr_adv_weight` is the coefficient on t
 
 The pipeline follows DART-GUI: prepare containers and MySQL, start the rollout model service, start the GUI runner, then start training. Paths, hosts, and passwords are environment variables or placeholders. Set them for your machine before launching.
 
-For the original DART-GUI image, SQL schema, and environment instructions, see:
+For the original DART-GUI image, SQL schema, and GUI environment, see:
 
 * DART-GUI: https://github.com/computer-use-agents/dart-gui
-* GUI environment: `GUI-Docker-Env/`
-* Longer infrastructure notes copied from the training stack: `README.md.infra_backup`
 
 ### 1. Preparation
 
@@ -76,7 +74,7 @@ export DB_PORT="3306"
 export DB_CHARSET="utf8mb4"
 ```
 
-Put the same host, user, password, and database in `dart_rollouter/config/config.yaml` under `mysql`. The schema for `rollout_run` and `checkpoint` is described in `README.md.infra_backup`.
+Put the same host, user, password, and database in `dart_rollouter/config/config.yaml` under `mysql`. Use the DART-GUI schema for `rollout_run` and `checkpoint`.
 
 ### 3. Rollout
 

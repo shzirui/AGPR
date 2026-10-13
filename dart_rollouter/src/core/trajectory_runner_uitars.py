@@ -12,8 +12,16 @@ from src.utils.ui_tars_utils import *
 from src.utils.log_config import setup_logging
 from src.utils.kill_all_env import stop_emulator
 from src.core.group import async_group_steps
-from src.core.score_backward_multi import async_score_recursive_step_multi_turn
-from src.core.score_backward_single import async_score_recursive_step_single_turn
+from src.core.group_multi import async_group_steps as async_group_steps_multi
+from src.core.score_backward_multi import async_score_recursive_step_multi_turn, async_refine_group_judgments_multi_turn
+from src.core.score_backward_single import async_score_recursive_step_single_turn, async_refine_group_judgments_single_turn
+from src.core.prm_validation import (
+    PRMValidationError,
+    derive_group_score,
+    validate_final_step_coverage,
+    validate_grouped_step_coverage,
+)
+from src.core.seekjudge_rl import evaluate_seekjudge_process_reward
 from copy import deepcopy
 from dotenv import load_dotenv
 import json
@@ -23,9 +31,45 @@ class ResourceExhaustedException(Exception):
     """Resource exhaustion exception"""
     pass
 
+
+def _emulator_id_for_log(env) -> Optional[str]:
+    provider = getattr(env, "provider", None) if env is not None else None
+    return getattr(provider, "emulator_id", None)
+
 # Setup unified logging system
 setup_logging()
 logger = logging.getLogger(__name__)
+
+
+def _raw_process_reward_payload(step_scores, group_scores):
+    """Keep PR components separate in SQL while retaining step alignment."""
+    return {
+        "format": "raw_pr_v1",
+        "step_scores": step_scores,
+        "group_scores": group_scores,
+    }
+
+
+def _valid_process_reward(process_reward):
+    """Validate both legacy lists and raw component payloads before insertion."""
+    if isinstance(process_reward, dict):
+        step_scores = process_reward.get("step_scores")
+        group_scores = process_reward.get("group_scores")
+        if not isinstance(step_scores, list) or not isinstance(group_scores, list):
+            return False
+        if len(step_scores) == 0 or len(step_scores) != len(group_scores):
+            return False
+        values = step_scores + group_scores
+    elif isinstance(process_reward, list):
+        if not process_reward:
+            return False
+        values = process_reward
+    else:
+        return False
+    try:
+        return all(float(value) >= 0 for value in values)
+    except (TypeError, ValueError):
+        return False
 
 """
 Refer to run_agent_loop.TrajectoryRunner
@@ -36,7 +80,7 @@ def pil_to_base64(img_bytes: bytes) -> str:
 
 @ray.remote
 class TrajectoryRunnerActor:
-    def __init__(self, task_info: Dict[str, Any], runner_cfg):
+    def __init__(self, task_info: Dict[str, Any], runner_cfg, process_reward_cfg=None):
         
         # --- load config ---
         self.runner_cfg = runner_cfg
@@ -44,6 +88,12 @@ class TrajectoryRunnerActor:
         self.max_tests = self.runner_cfg.max_texts
         self.max_steps = self.runner_cfg.max_steps
         self.root = self.runner_cfg.root
+        self.process_reward_cfg = process_reward_cfg
+        self.pr_backend = str(getattr(process_reward_cfg, "backend", "disabled")).lower()
+        if self.pr_backend not in {"disabled", "original", "seekjudge"}:
+            raise ValueError(f"Unsupported process_reward.backend: {self.pr_backend}")
+        self.pr_mode = str(getattr(process_reward_cfg, "mode", "single")).lower()
+        self.enable_pr_phase3 = bool(getattr(process_reward_cfg, "enable_phase3", False))
         # self.save_img_pt = self.runner_cfg.save_img_pt
         # self.rollout_n = self.runner_cfg.rollout_n
 
@@ -80,7 +130,7 @@ class TrajectoryRunnerActor:
         if not self.env_init_success:
             logger.warning(f"[{self.trace_id}] Environment initialization failed, cannot get service_id - task_id: {self.task_id}")
             return None
-        elif self.env is None:
+        elif self.env is None or getattr(self.env, "provider", None) is None:
             logger.warning(f"[{self.trace_id}] Environment not initialized, cannot get service_id - task_id: {self.task_id}")
             return None
         elif self.env.provider.emulator_id is None:
@@ -153,22 +203,23 @@ class TrajectoryRunnerActor:
                 logger.info(f"[{self.trace_id}] Environment initialization successful - task_id: {self.task_id}")
             except Exception as e:
                 self.env_init_success = False
-                logger.error(f"[{self.trace_id}] Environment initialization failed - task_id: {self.task_id}, Error: {e}")
-                # Save failed task info to json file in the storage folder
-                if not self.env_init_success:
-                    try:
-                        task_error_path = os.path.join(storage_root, f"task_{self.task_id}_trace_{self.trace_id}.json")
-                        error_info = {
-                            "task_id": self.task_id,
-                            "trace_id": self.trace_id,
-                            "error_type": str(e),
-                            "timestamp": datetime.datetime.now().isoformat()
-                        }
-                        with open(task_error_path, 'w', encoding='utf-8') as f:
-                            json.dump(error_info, f, indent=2, ensure_ascii=False)
-                        logger.info(f"[{self.trace_id}] Failed task info saved to: {task_error_path}")
-                    except Exception as e:
-                        logger.error(f"[{self.trace_id}] Failed to save failed task info - task_id: {self.task_id}, Error: {e}")
+                init_error = e
+                logger.error(f"[{self.trace_id}] Environment initialization failed - task_id: {self.task_id}, Error: {init_error}")
+                try:
+                    task_error_path = os.path.join(storage_root, f"task_{self.task_id}_trace_{self.trace_id}.json")
+                    error_info = {
+                        "task_id": self.task_id,
+                        "trace_id": self.trace_id,
+                        "error_type": str(init_error),
+                        "timestamp": datetime.datetime.now().isoformat()
+                    }
+                    with open(task_error_path, 'w', encoding='utf-8') as f:
+                        json.dump(error_info, f, indent=2, ensure_ascii=False)
+                    logger.info(f"[{self.trace_id}] Failed task info saved to: {task_error_path}")
+                except Exception as save_error:
+                    logger.error(f"[{self.trace_id}] Failed to save failed task info - task_id: {self.task_id}, Error: {save_error}")
+                if isinstance(init_error, ResourceExhaustedException):
+                    raise init_error
             finally:
                 # Set event regardless of success or failure so waiting parties know initialization process is complete
                 self.env_ready.set()
@@ -330,6 +381,34 @@ class TrajectoryRunnerActor:
 
             await model_pool.save_messages_reward.remote(full_messages, reward, self.task_id, self.trace_id)
 
+            # When enabled together with PR, release the VM before the slow PR pass.
+            # The coordinator will run the deferred post-processing on this actor.
+            if (
+                bool(getattr(self.process_reward_cfg, "release_env_before_evaluation", False))
+                and pr_model_pool
+                and reward >= 0
+                and step > 0
+                and not flag_vllm_error
+            ):
+                deferred_data = {
+                    "full_messages": full_messages,
+                    "reward": reward,
+                    "step": step,
+                    "action": action,
+                    "flag_vllm_error": flag_vllm_error,
+                    "model_path": model_path,
+                    "storage_root": storage_root,
+                }
+                if self.env is not None:
+                    try:
+                        self.env.close()
+                        logger.info(f"[{self.trace_id}] Environment closed before PR evaluation - task_id: {self.task_id}")
+                    except Exception as e:
+                        logger.error(f"[{self.trace_id}] Error closing environment before PR evaluation: {e}")
+                    finally:
+                        self.env = None
+                return {"defer_pr": True, "data": deferred_data}
+
             process_reward_list = []
             detailed_prm_json = None
             if pr_model_pool and reward >= 0 and step > 0 and not flag_vllm_error:
@@ -369,7 +448,7 @@ class TrajectoryRunnerActor:
                 }
                 logger.info(f"[{self.trace_id}] Begin to insert mysql")
                 if pr_model_pool:
-                    if process_reward_list and all(r >= 0 for r in process_reward_list):
+                    if _valid_process_reward(process_reward_list):
                         if reward>0:
                             logger.info(f"[{self.trace_id}] Stored in mySQL database")
                             await mysql_writer.insert_run.remote(meta)
@@ -397,8 +476,11 @@ class TrajectoryRunnerActor:
                         logger.info(f"[{self.trace_id}] Reward less than 0, not stored in mySQL database")
             logger.info(f"[{self.trace_id}] Task trajectory execution complete - task_id: {self.task_id}, Total steps: {step}")           
  
+        except ResourceExhaustedException:
+            raise
         except Exception as e:
             logger.error(f"[{self.trace_id}] Task trajectory execution failed - task_id: {self.task_id}, Error: {e}")
+            raise
         finally:
             # Cancel environment timeout monitoring task
             if self.env_timeout_task is not None and not self.env_timeout_task.done():
@@ -410,16 +492,113 @@ class TrajectoryRunnerActor:
             # Ensure environment is released regardless of success or failure
             if self.env is not None:
                 try:
+                    emu_id = _emulator_id_for_log(self.env)
                     self.env.close()
-                    logger.info(f"[{self.trace_id}] Environment closed - Environment emulator_id: {self.env.provider.emulator_id} - task_id: {self.task_id}")
+                    logger.info(f"[{self.trace_id}] Environment closed - Environment emulator_id: {emu_id} - task_id: {self.task_id}")
                 except Exception as e:
                     logger.error(f"[{self.trace_id}] Error closing environment - task_id: {self.task_id}, Error: {e}")
                 finally:
                     self.env = None
 
-       
-    
         return True
+
+    async def run_pr_postprocess(self, deferred_data, pr_model_pool, storage, mysql_writer):
+        """Run PR evaluation and database insertion after the VM is released."""
+        full_messages = deferred_data["full_messages"]
+        reward = deferred_data["reward"]
+        step = deferred_data["step"]
+        action = deferred_data["action"]
+        flag_vllm_error = deferred_data["flag_vllm_error"]
+        model_path = deferred_data["model_path"]
+        storage_root = deferred_data["storage_root"]
+
+        try:
+            logger.info(f"[{self.trace_id}] Starting deferred PR evaluation - task_id: {self.task_id}")
+            process_reward_list, detailed_prm_json = await self.evaluate_process_reward(
+                pr_model_pool, full_messages, float(reward)
+            )
+            logger.info(f"[{self.trace_id}] Deferred PR evaluation done. Array: {process_reward_list}")
+
+            if detailed_prm_json:
+                try:
+                    await storage.save_prm_detail.remote(self.task_root, detailed_prm_json)
+                    logger.info(f"[{self.trace_id}] Saved detailed PR JSON via StorageActor.")
+                except Exception as e:
+                    logger.error(f"[{self.trace_id}] Failed to save detailed PR JSON: {e}")
+
+            await self._write_mysql_result(
+                mysql_writer=mysql_writer,
+                pr_model_pool=pr_model_pool,
+                storage_root=storage_root,
+                process_reward_list=process_reward_list,
+                reward=reward,
+                step=step,
+                action=action,
+                flag_vllm_error=flag_vllm_error,
+                model_path=model_path,
+            )
+            return True
+        except Exception as e:
+            logger.error(f"[{self.trace_id}] Deferred PR post-processing failed: {e}")
+            return False
+
+    async def _write_mysql_result(
+        self,
+        mysql_writer,
+        pr_model_pool,
+        storage_root,
+        process_reward_list,
+        reward,
+        step,
+        action,
+        flag_vllm_error,
+        model_path,
+    ):
+        """Write deferred PR results using the existing insertion rules."""
+        if not self.runner_cfg.write_to_mysql or flag_vllm_error:
+            return
+
+        pr_sql_value = json.dumps(process_reward_list)
+        meta = {
+            "run_id": storage_root,
+            "trajectory_id": self.task_root,
+            "task_id": self.task_id,
+            "trace_id": self.trace_id,
+            "reward": reward,
+            "process_reward": pr_sql_value,
+            "model_version": model_path,
+            "instruction": self.task_cfg["instruction"],
+            "num_chunks": step if action == "DONE" else step - 1,
+        }
+
+        logger.info(f"[{self.trace_id}] Begin to insert deferred PR result into mysql")
+        if pr_model_pool:
+            if _valid_process_reward(process_reward_list):
+                if reward > 0:
+                    await mysql_writer.insert_run.remote(meta)
+                    logger.info(f"[{self.trace_id}] Stored deferred PR result in mySQL database")
+                elif reward == 0:
+                    if step >= 4:
+                        await mysql_writer.insert_run.remote(meta)
+                        logger.info(f"[{self.trace_id}] Stored deferred PR result in mySQL database")
+                    else:
+                        logger.info(f"[{self.trace_id}] Reward is 0, steps less than 4, not stored in mySQL database")
+                else:
+                    logger.info(f"[{self.trace_id}] Reward less than 0, not stored in mySQL database")
+            else:
+                logger.info(f"[{self.trace_id}] Process reward list contains invalid scores, not stored in mySQL database")
+        else:
+            if reward > 0:
+                await mysql_writer.insert_run.remote(meta)
+                logger.info(f"[{self.trace_id}] Stored deferred result in mySQL database")
+            elif reward == 0:
+                if step >= 4:
+                    await mysql_writer.insert_run.remote(meta)
+                    logger.info(f"[{self.trace_id}] Stored deferred result in mySQL database")
+                else:
+                    logger.info(f"[{self.trace_id}] Reward is 0, steps less than 4, not stored in mySQL database")
+            else:
+                logger.info(f"[{self.trace_id}] Reward less than 0, not stored in mySQL database")
     
     def _init_env(self, env_cfg):  
         # Add retry logic for RemoteDesktopEnv initialization
@@ -437,13 +616,25 @@ class TrajectoryRunnerActor:
                 logger.info(f"[{self.trace_id}] Environment initialization successful - task_id: {self.task_id}, Attempt: {attempt + 1}")
                 break
             except Exception as e:
-                
-                logger.warning(f"[{self.trace_id}] Environment initialization failed - task_id: {self.task_id}, Attempt: {attempt + 1}, Error: {e} \n Environment initialization failed, environment closed - Environment emulator_id: {self.env.provider.emulator_id}")
+                emu_id = _emulator_id_for_log(self.env)
+                logger.warning(
+                    f"[{self.trace_id}] Environment initialization failed - task_id: {self.task_id}, "
+                    f"Attempt: {attempt + 1}, Error: {e}; emulator_id: {emu_id}"
+                )
+                try:
+                    if self.env is not None:
+                        self.env.close()
+                except Exception as close_error:
+                    logger.warning(f"[{self.trace_id}] Failed to close env after init error: {close_error}")
+                finally:
+                    self.env = None
                 if attempt == max_retries - 1:
                     logger.error(f"[{self.trace_id}] All retry attempts failed - task_id: {self.task_id}")
+                    err_s = str(e).lower()
+                    if any(key in err_s for key in ("quota", "failed to start emulator", "no available")):
+                        raise ResourceExhaustedException(str(e)) from e
                     raise
                 logger.info(f"[{self.trace_id}] Preparing to retry - task_id: {self.task_id}, Next attempt: {attempt + 2}/{max_retries}")
-                self.env.close()
 
 
     async def _call_model(self, model_pool, messages: str, model_cfg, step):
@@ -517,15 +708,16 @@ class TrajectoryRunnerActor:
         for attempt in range(retries):
             try:
                 # 复用 model_pool 的底层通讯！
-                response, _ = await asyncio.wait_for(
+                prm_result = await asyncio.wait_for(
                     pr_model_pool.generate_vllm.remote(
                         messages=messages,
                         temperature=temperature,
                         max_tokens=max_tokens,
-                        logprobs=False
+                        chat_template_kwargs={"enable_thinking": False}
                     ),
                     timeout=120.0
                 )
+                response = prm_result[0] if isinstance(prm_result, (tuple, list)) else prm_result
                 if response:
                     # 清洗 JSON
                     content = re.sub(r"```json\s*", "", response, flags=re.IGNORECASE)
@@ -537,84 +729,232 @@ class TrajectoryRunnerActor:
                     return None
                 await asyncio.sleep(5)
         return None
+
+    async def _async_call_seekjudge(self, pr_model_pool, messages, **kwargs):
+        """Call the active PR pool while preserving optional tool-call messages."""
+        chat_template_kwargs = dict(kwargs.get("chat_template_kwargs") or {})
+        chat_template_kwargs["enable_thinking"] = False
+        kwargs["chat_template_kwargs"] = chat_template_kwargs
+        retries = max(
+            1,
+            int(getattr(self.process_reward_cfg, "max_retries", 3)),
+        )
+        for attempt in range(retries):
+            try:
+                result = await asyncio.wait_for(
+                    pr_model_pool.generate_vllm.remote(messages=messages, **kwargs),
+                    timeout=1800.0,
+                )
+                return result[0] if isinstance(result, (tuple, list)) else result
+            except Exception as error:
+                if attempt == retries - 1:
+                    raise RuntimeError("SeekJudge model call failed") from error
+                await asyncio.sleep(5)
     
-    async def evaluate_process_reward(self, prm_model_pool, full_messages: List[Dict], outcome_reward: float) -> List[float]:
+    async def evaluate_process_reward(self, pr_model_pool, full_messages: List[Dict], outcome_reward: float):
         # 1. 提取出 task_instruction 和 steps
         task_instruction, steps = self._extract_trace_from_memory(full_messages)
         total_steps = len(steps)
-        pr_array = [-1] * total_steps 
+        step_score_array = [-1] * total_steps
+        group_score_array = [-1] * total_steps
 
-        if not steps or not prm_model_pool:
-            return pr_array
+        def raw_pr_payload():
+            return _raw_process_reward_payload(step_score_array, group_score_array)
+
+        if self.pr_backend == "seekjudge":
+            try:
+                async def call_seekjudge(messages, **kwargs):
+                    return await self._async_call_seekjudge(pr_model_pool, messages, **kwargs)
+
+                return await evaluate_seekjudge_process_reward(
+                    full_messages=full_messages,
+                    task_instruction=task_instruction or self.task_cfg.get("instruction", ""),
+                    source_dir=os.path.join(self.root, self.task_root),
+                    async_call_llm_fn=call_seekjudge,
+                    config=self.process_reward_cfg,
+                    task_id=self.task_id,
+                )
+            except Exception as error:
+                logger.exception(f"[{self.trace_id}] SeekJudge evaluation failed: {error}")
+                return raw_pr_payload(), None
+
+        if not steps or not pr_model_pool:
+            return raw_pr_payload(), None
+
+        pr_mode = self.pr_mode
+        enable_pr_phase3 = self.enable_pr_phase3
+        group_fn = async_group_steps_multi if pr_mode == "multi" else async_group_steps
+        score_fn = async_score_recursive_step_multi_turn if pr_mode == "multi" else async_score_recursive_step_single_turn
+        refine_fn = async_refine_group_judgments_multi_turn if pr_mode == "multi" else async_refine_group_judgments_single_turn
 
         # 2. 构造一个能自动绑定当前模型池的 async 回调函数
-        async def call_llm_callback(messages):
+        async def call_llm_callback(messages, max_tokens=4096):
             return await self._async_call_prm(
-                prm_model_pool=prm_model_pool, 
+                pr_model_pool=pr_model_pool, 
                 messages=messages, 
                 temperature=0.1, 
-                max_tokens=2048
+                max_tokens=max_tokens
             )
 
         # 3. ✨ 一行代码搞定复杂的分组逻辑！
-        enriched_subgoals = await async_group_steps(task_instruction, steps, call_llm_callback)
+        enriched_subgoals = await group_fn(task_instruction, steps, call_llm_callback)
         
         if not enriched_subgoals:
             logger.warning(f"[{self.trace_id}] Grouping returned empty, fallback to -1")
-            return pr_array
+            return raw_pr_payload(), None
+
+        try:
+            validate_grouped_step_coverage(
+                enriched_subgoals, total_steps, require_windows=(pr_mode == "multi")
+            )
+        except PRMValidationError as error:
+            logger.warning(f"[{self.trace_id}] Invalid grouping structure: {error}")
+            return raw_pr_payload(), None
 
         logger.info(f"[{self.trace_id}] Grouping success, got {len(enriched_subgoals)} parts.")
 
-        current_outcome_reward = outcome_reward
-        logger.info(f"[{self.trace_id}] Start backward scoring for {len(enriched_subgoals)} groups...")
+        previous_group_result_lines = []
+        logger.info(f"[{self.trace_id}] Start forward scoring for {len(enriched_subgoals)} groups...")
         
         # 为了兼容图片路径读取，由于我们的 evaluate 是在当前任务完成后立刻触发的
         # storage 上的文件其实就在你的 self.task_root 对应的目录下 (或者绝对路径)
         # 这里你可以直接传入你保存图片的根目录，如果不确定可以写 "./"
-        task_dir = os.path.join(self.root, self.task_root) 
+        task_dir = os.path.join(self.root, self.task_root)
 
-        for idx in range(len(enriched_subgoals) - 1, -1, -1):
-            eval_res = await async_score_recursive_step_single_turn(
+        for idx in range(len(enriched_subgoals)):
+            previous_group_results = "\n".join(previous_group_result_lines)
+            eval_res = await score_fn(
                 task_instruction=task_instruction,
                 task_root_path=task_dir,
                 all_subgoals=enriched_subgoals,
                 current_idx=idx,
-                current_outcome_reward=current_outcome_reward,
+                previous_group_results=previous_group_results,
                 async_call_llm_fn=call_llm_callback
             )
             
-            if not eval_res: 
-                logger.warning(f"[{self.trace_id}] Eval for Group {idx+1} returned None. Keeping defaults for remaining.")
-                break 
+            if not eval_res:
+                logger.warning(f"[{self.trace_id}] Eval for Group {idx+1} failed after structural retries. Rejecting trace.")
+                return raw_pr_payload(), None
             
-            # 解析打分并填入数组
+            # Store scoring results first; final process rewards are computed after all groups are scored.
             enriched_subgoals[idx]['evaluation'] = eval_res
 
             group_conclusion = eval_res.get("current_group_conclusion", {})
-            group_score = float(group_conclusion.get("score", -1))
+            try:
+                group_score = derive_group_score(
+                    group_conclusion["subgoal_status"],
+                    group_conclusion["goal_contribution"],
+                )
+            except (KeyError, PRMValidationError) as error:
+                logger.warning(f"[{self.trace_id}] Invalid Phase 2 group judgment: {error}")
+                return raw_pr_payload(), None
+	            
+            previous_group_result_lines.append(
+                f"Group {idx + 1}:\n"
+                f"  subgoal: {enriched_subgoals[idx].get('subgoal_name', 'Unknown')}\n"
+                f"  reasoning: {enriched_subgoals[idx].get('reasoning', 'Unknown')}\n"
+                f"  score: {group_score}\n"
+                f"  summary: {group_conclusion.get('history_summary_for_next_group') or group_conclusion.get('reason', '')}\n"
+                f"  status: {group_conclusion.get('subgoal_status', 'Unknown')}\n"
+                f"  contribution: {group_conclusion.get('goal_contribution', 'Unknown')}"
+            )
 
-            step_critics = eval_res.get("step_critic", [])
-            for sc in step_critics:
-                s_idx = sc.get("step_index", 1) - 1 
-                if 0 <= s_idx < total_steps:
+        phase3_refinement = None
+        if enable_pr_phase3:
+            logger.info(f"[{self.trace_id}] Start Phase 3 group-level refinement...")
+            phase3_refinement = await refine_fn(
+                task_instruction=task_instruction,
+                all_subgoals=enriched_subgoals,
+                outcome_reward=outcome_reward,
+                async_call_llm_fn=call_llm_callback
+            )
+            if phase3_refinement:
+                for item in phase3_refinement.get("refined_group_conclusions", []):
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        group_index = int(item.get("group_index", 0)) - 1
+                    except Exception:
+                        continue
+                    if 0 <= group_index < len(enriched_subgoals):
+                        enriched_subgoals[group_index]["refined_group_conclusion"] = item
+                logger.info(f"[{self.trace_id}] Phase 3 refinement done.")
+            else:
+                logger.warning(f"[{self.trace_id}] Phase 3 failed after structural retries. Rejecting trace.")
+                return raw_pr_payload(), None
+
+        try:
+            validate_final_step_coverage(enriched_subgoals, total_steps)
+        except PRMValidationError as error:
+            logger.warning(f"[{self.trace_id}] Incomplete final scoring structure: {error}")
+            return raw_pr_payload(), None
+
+        refined_score_by_group = {}
+        if phase3_refinement:
+            for item in phase3_refinement.get("refined_group_conclusions", []):
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    group_index = int(item.get("group_index", 0)) - 1
+                    refined_score = derive_group_score(
+                        item["refined_subgoal_status"],
+                        item["refined_goal_contribution"],
+                    )
+                except (KeyError, PRMValidationError):
+                    continue
+                if 0 <= group_index < len(enriched_subgoals) and refined_score >= 0:
+                    refined_score_by_group[group_index] = refined_score
+
+        for idx, subgoal in enumerate(enriched_subgoals):
+            eval_res = subgoal.get("evaluation")
+            if not isinstance(eval_res, dict):
+                continue
+            group_conclusion = eval_res.get("current_group_conclusion", {})
+            try:
+                group_score = refined_score_by_group.get(
+                    idx,
+                    derive_group_score(
+                        group_conclusion["subgoal_status"],
+                        group_conclusion["goal_contribution"],
+                    ),
+                )
+            except (KeyError, PRMValidationError):
+                group_score = -1
+            if group_score < 0:
+                continue
+
+            for sc in eval_res.get("step_critic", []):
+                if not isinstance(sc, dict):
+                    continue
+                try:
+                    s_idx = int(sc.get("step_index", 1)) - 1
                     step_score = float(sc.get("score", -1))
-                    
-                    if step_score >= 0 and group_score >= 0:
-                        pr_array[s_idx] = step_score * group_score
-            
-            # 传递下一轮(上一组)的 Reward
-            prev_judgement = eval_res.get('previous_group_judgment', {})
-            current_outcome_reward = float(prev_judgement.get('prev_outcome_reward', current_outcome_reward))
-        
+                except Exception:
+                    continue
+                if 0 <= s_idx < total_steps and step_score >= 0:
+                    step_score_array[s_idx] = step_score
+                    group_score_array[s_idx] = group_score
+
+        if (
+            len(step_score_array) != total_steps
+            or len(group_score_array) != total_steps
+            or any(score < 0 for score in step_score_array)
+            or any(score < 0 for score in group_score_array)
+        ):
+            logger.warning(f"[{self.trace_id}] Process rewards do not cover every step. Rejecting trace.")
+            return raw_pr_payload(), None
+
         detailed_prm_data = {
             "task_id": self.task_id,
             "trace_id": self.trace_id,
             "overall_reward": outcome_reward,
             "task_instruction": task_instruction,
+            "enable_pr_phase3": enable_pr_phase3,
+            "phase3_refinement": phase3_refinement,
             "subgoals": enriched_subgoals  # 包含了步骤、图文、以及刚才塞进去的 evaluation
         }
 
-        return pr_array, detailed_prm_data
+        return raw_pr_payload(), detailed_prm_data
          
     def _add_image(self, img_bytes: bytes, frame_path: str):
         

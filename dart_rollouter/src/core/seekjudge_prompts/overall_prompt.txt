@@ -1,0 +1,190 @@
+# Overall Trajectory Evaluation: 7-Dimension Scoring (0-100)
+
+You are evaluating an agent's GUI task trajectory. Score each dimension 0-100 based on the goal, actions, and observable results.
+
+CRITICAL DISTINCTION: You must distinguish between the agent's PERFORMANCE and the ENVIRONMENT's PROPERTIES. The agent making mistakes does NOT make the goal infeasible or ambiguous — those are properties of the goal and environment BEFORE the agent acts.
+
+---
+
+## Dimension Definitions
+
+### 1. `goal_infeasibility` (0-100)
+The likelihood the goal is INHERENTLY impossible in this environment, REGARDLESS of agent behavior.
+
+- **0** = Goal is clearly feasible. The required UI, data, and features exist.
+- **50** = Uncertain — some required elements may not exist, but inconclusive.
+- **100** = Goal is impossible — required functionality/data provably absent.
+
+CRITICAL: This measures the ENVIRONMENT, not the agent's skill. Infeasibility means the goal CANNOT be done by ANY agent in this environment because required objects/data/features don't exist.
+
+Check each sub-task: does the target object actually exist in the environment?
+- Goal says "delete X" but X is not visible anywhere in the UI → infeasible for that sub-task
+- Goal says "find person Y" but Y doesn't appear in the data → possibly infeasible
+- Goal requires visual identification but only text descriptions are available → partially infeasible
+- A filter returns 0 results because the agent used the wrong field → NOT infeasible (correct field would work)
+- The required application doesn't exist → infeasible
+
+If 1 of N sub-tasks targets a non-existent object, score proportionally (e.g., 1/4 infeasible → ~25-35).
+Agent failure due to mistakes does NOT increase infeasibility — only missing environment capabilities/data does.
+
+IMPORTANT: When you are uncertain about infeasibility (e.g., the target might exist elsewhere in the environment but isn't visible), score in the MODERATE range (20-40) rather than at the extremes (0 or 100). Avoid 0 unless you are CERTAIN the goal is fully feasible.
+
+### 2. `goal_ambiguity` (0-100)
+How ambiguous or underspecified the goal text is.
+
+- **0** = Perfectly unambiguous; exactly one correct outcome.
+- **50** = Some ambiguity; a few reasonable interpretations.
+- **100** = Extremely vague; many valid interpretations.
+
+This is about the GOAL TEXT itself, not the agent's understanding of it. Scoring anchors:
+- **0-15**: Goal has explicit numbered steps with specific named targets and exact values.
+- **15-35**: Goal has mostly specific instructions but 1-2 elements need interpretation.
+- **35-55**: Goal references something requiring context (e.g., visual identification, implicit knowledge).
+- **55+**: Goal is fundamentally vague with multiple valid outcomes.
+
+A goal with numbered steps like "Navigate to X, filter for Y, order Z" is LOW ambiguity (0-20) even if step details require the agent to discover information.
+
+### 3. `exploration_degree` (0-100)
+How appropriately the agent explored relative to the task's needs.
+
+First determine if the task REQUIRES exploration:
+- **Task requires exploration** (discover info, find items, navigate unfamiliar UI): 0 = no exploration (blind guess), 50 = some but incomplete, 100 = thorough and efficient.
+- **Task does NOT require exploration** (known direct path): 50 = correctly didn't explore (baseline). Lower if agent explored unnecessarily, higher only if agent efficiently confirmed the path.
+
+Key distinctions:
+- Following a wrong strategy (e.g., text search when visual identification is needed) is NOT effective exploration — score lower.
+- Routine UI navigation (clicking tabs, opening menus, selecting options along a known path) is NOT exploration — it's just execution. A long sequence of menu clicks to reach a known destination is routine, not exploration.
+- Exploration means the agent is DISCOVERING information or SEARCHING for something unknown. Simply following a multi-step workflow through familiar UI is execution, not exploration.
+
+### 4. `path_redundancy` (0-100)
+How much unnecessary redundancy exists in the path.
+
+- **0** = Most direct path possible. Default here if unsure whether shorter path exists.
+- **50** = About half the steps were unnecessary.
+- **100** = Path dominated by wasted steps.
+
+CALIBRATION: Calculate the fraction of steps that were clearly unnecessary (detours, repeated actions, wrong-strategy steps). Use that fraction as a rough guide:
+- 0-10% wasted steps → score 0-10
+- 10-25% wasted steps → score 10-25
+- 25-50% wasted steps → score 25-50
+- 50-75% wasted steps → score 50-75
+- 75-100% wasted steps → score 75-100
+
+IMPORTANT: Only count steps as redundant if they were clearly unnecessary — repeated identical actions, navigation detours that were reversed, steps in a completely wrong strategy. Steps that are part of the CORRECT workflow (clicking tabs, opening menus, typing values) are NOT redundant. A long trajectory is NOT necessarily redundant if most steps serve the goal.
+
+Note: A wrong_action (clicking wrong target) is an ERROR, not redundancy. Only count it as redundancy if it led to a chain of wasted follow-up steps. A single wrong click that was quickly corrected adds minimal redundancy.
+
+### 5. `positive_evidence_reliability` (0-100)
+How reliable the POSITIVE evidence is that the goal was completed CORRECTLY.
+
+- **0** = No positive evidence whatsoever.
+- **50** = Some positive evidence, but weak, indirect, or only partially verified.
+- **100** = Strong, direct, verified evidence of correct completion.
+
+CRITICAL VERIFICATION RULES — you must check each of the following:
+- For each sub-task, verify the agent operated on the CORRECT target (correct file, correct item, correct person, correct field). An action on the wrong target produces ZERO positive evidence for that sub-task, even if the action itself was executed flawlessly.
+- Compare every value the agent produced against what the goal requires. Small differences (wrong name, wrong item, wrong number) mean the evidence is NOT reliable.
+- An UNVERIFIED_CLAIM is NOT positive evidence by itself. Check if the claim is supported by observable UI state.
+- If the agent's answer was reached through an unreliable chain of reasoning (e.g., indirect inference, guessing), the evidence is weak even if the final answer happens to match.
+
+CRITICAL — use prior analysis (tool call results) as ground truth:
+If the trajectory includes AnalyseAgent/tool results showing that the goal's target object is NOT present in the starting state (e.g., "no person in red jacket visible"), then:
+- Any identification of the target through indirect methods (text search, inference chains) is NOT directly verified — the agent never confirmed the target visually
+- The UNVERIFIED_CLAIM based on such indirect identification has WEAK positive evidence
+- Score positive_evidence in the LOW-TO-MODERATE range (20-50): give some credit if the inference chain is documented and plausible, but penalize significantly because the core identification was never grounded in direct observable evidence
+- A plausible chain built on an unverified premise provides SOME evidence but not strong evidence
+
+Examples of UNRELIABLE positive evidence (score low):
+- Agent deleted a file, but it was the WRONG file (wrong name in confirmation dialog)
+- Agent ordered an item, but it was the WRONG item (different from what was requested)
+- Agent found an answer through a text search chain that involved guessing/inference, and prior analysis confirms the target was NOT visually identifiable
+- Agent claimed "done" but the UI shows the task is incomplete
+
+### 6. `negative_evidence_reliability` (0-100)
+How reliable the NEGATIVE evidence is that the goal was NOT completed correctly.
+
+- **0** = No negative evidence; everything appears to have succeeded.
+- **50** = Some negative signals, but ambiguous.
+- **100** = Strong, definitive evidence of failure.
+
+CRITICAL — look for these specific negative signals:
+- Agent operated on the WRONG target (wrong file, wrong item, wrong field) — this is strong negative evidence even if the agent didn't notice
+- Confirmation dialogs showing wrong names/values that the agent accepted
+- Agent's claimed answer contradicts what the trajectory shows
+- A required sub-task was never attempted or was abandoned mid-way
+- An interactive prompt (Y/n, Save dialog) was abandoned without completion
+- The agent claimed completion but observable UI state contradicts the claim
+- Error messages appeared that were never resolved
+
+IMPORTANT DISTINCTION: Negative evidence is about the OUTCOME, not the PROCESS. An agent that struggles, takes detours, or makes intermediate mistakes but ultimately produces the correct result has LOW negative evidence. Only score high if the FINAL outcome is demonstrably wrong or incomplete. Specifically:
+- Agent took a roundabout path but succeeded → low negative evidence (process struggles don't matter)
+- Agent used the wrong filter field, then corrected and found the right answer → low negative evidence
+- Agent produced a wrong final answer or left a sub-task incomplete → high negative evidence
+- Agent's identification was indirect/unverified (analysis confirms target not visible) → MODERATE negative evidence (25-45): the identification is questionable but not definitively proven wrong
+
+### 7. `completion_progress` (0-100)
+How much of the goal the agent CORRECTLY completed.
+
+- **0** = No progress; nothing useful accomplished.
+- **50** = About half of sub-tasks correctly completed.
+- **100** = All sub-tasks correctly completed and verified.
+
+CRITICAL: Only count sub-tasks as completed if they were done CORRECTLY and VERIFIABLY. A sub-task performed on the wrong target does NOT count as progress. An answer based on an unverified identification (where prior analysis shows the target was NOT observable) does NOT count as verified completion. Specifically:
+- Break the goal into sub-tasks
+- For each sub-task, verify it was done on the correct target with the correct value
+- Sub-tasks done incorrectly (wrong target, wrong value) count as 0% for that sub-task
+- Sub-tasks that were abandoned before completion count as partial credit at best
+
+---
+
+## Analysis Process
+
+Follow these steps before scoring:
+
+**Step 1: Goal Decomposition** — List each sub-task and its success criteria. Identify what "correct" means for each.
+
+**Step 2: Sub-task Verification** — For each sub-task, trace through the trajectory:
+- Was it attempted?
+- Was it performed on the CORRECT target? (Check names, values, IDs carefully)
+- Was it completed successfully?
+- Is the result verifiable from the UI state?
+
+**Step 3: Error Detection** — Look for:
+- Wrong targets (wrong file, wrong item, wrong field selected)
+- Wrong values (wrong text typed, wrong option chosen)
+- Abandoned operations (Y/n prompts, save dialogs left incomplete)
+- Claims contradicted by UI state
+
+**Step 4: Independent Scoring** — Score each dimension based on the definitions. Remember: goal_infeasibility and goal_ambiguity are about the goal/environment, NOT the agent's performance.
+
+**Step 5: Consistency Check** — Before finalizing, verify:
+- If positive_evidence is high (>70), completion_progress should also be high (and vice versa).
+- If negative_evidence is high (>60), completion_progress should be limited.
+- path_redundancy should roughly match the fraction of wasted steps you identified.
+- goal_infeasibility should be 0 ONLY if ALL sub-task targets are confirmed to exist.
+
+---
+
+## Output Instruction
+
+First provide your reasoning. Then output your final classification.
+
+You MUST output exactly 7 labels. You must use <answer_overall> and </answer_overall>.
+
+Output your answer in the following format:
+
+My reasoning analysis is: ....
+
+<answer_overall>
+{
+  "goal_infeasibility": <0-100>,
+  "goal_ambiguity": <0-100>,
+  "exploration_degree": <0-100>,
+  "path_redundancy": <0-100>,
+  "positive_evidence_reliability": <0-100>,
+  "negative_evidence_reliability": <0-100>,
+  "completion_progress": <0-100>
+}
+</answer_overall>
+
+All values must be integers between 0 and 100.

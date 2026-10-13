@@ -89,6 +89,13 @@ class StorageActor:
 
         await asyncio.to_thread(torch.save, data_to_save, fn)
 
+    async def save_parsed_actions(self, task_root: str, parsed_actions: list[dict]):
+        save_dir = self.root / task_root
+        save_dir.mkdir(exist_ok=True)
+        fn = save_dir / "parsed_actions.json"
+        async with aiofiles.open(fn, "w") as f:
+            await f.write(json.dumps(parsed_actions, ensure_ascii=False, indent=2))
+
     async def save_img_pt(self, task_root: str, images: list, image_grid_thw: torch.Tensor, num_patches_list: list[int], pixel_values):
         """
         Save image tensors and patch information as .pt file.

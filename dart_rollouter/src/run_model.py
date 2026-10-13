@@ -42,14 +42,7 @@ def main(cfg: DictConfig):
         replicas=cfg.model.replicas,
         vllm_params=OmegaConf.to_container(cfg.model.vllm_params),
         save_local=cfg.model.save_local,
-        save_path=cfg.storage.root,
-        enable_lora=cfg.model.get("enable_lora", False),
-        lora_adapter_path=cfg.model.get("lora_adapter_path", None),
-        max_lora_rank=cfg.model.get("max_lora_rank", 32),
-        use_vllm_v0_compat=cfg.model.get("use_vllm_v0_compat", False),
-        enable_qwen3_vllm_options=cfg.model.get("enable_qwen3_vllm_options", False),
-        max_model_len=cfg.model.get("max_model_len", None),
-        reasoning_parser=cfg.model.get("reasoning_parser", None),
+        save_path=cfg.storage.root
     )
 
     # 定义并创建 lifespan 函数的闭包
@@ -104,14 +97,13 @@ def main(cfg: DictConfig):
             messages=request.messages,
             reward=request.reward,
             task_id=request.task_id,
-            trace_id=request.trace_id,
-            parsed_actions=request.parsed_actions,
+            trace_id=request.trace_id
         )
 
     @app.post("/reload", summary="Reload model with rolling update")
     async def reload_model(request: ReloadRequest, pool: ModelServicePool = Depends(get_model_pool)):
         """通过滚动更新的方式重新加载模型。"""
-        asyncio.create_task(pool.roll_reload(request.new_ckpt_path, request.batch_size, request.lora_adapter_path))
+        asyncio.create_task(pool.roll_reload(request.new_ckpt_path, request.batch_size))
         return {"message": "Model rolling reload process initiated successfully."}
 
     @app.post("/remove_service_by_id", summary="Remove a service instance by gpu id")

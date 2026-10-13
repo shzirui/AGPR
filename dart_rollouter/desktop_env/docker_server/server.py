@@ -46,7 +46,7 @@ WAIT_TIME = 3
 RETRY_INTERVAL = 1
 LOCK_TIMEOUT = 10
 # VM path from config (with default for fallback)
-DEFAULT_VM_PATH = "/home/pengxiang/codes/GUI-Docker-Env-main/Ubuntu.qcow2"
+DEFAULT_VM_PATH = "/path/to/Ubuntu.qcow2"
 PATH_TO_VM = _cfg_get("remote_docker_server.path_to_vm", DEFAULT_VM_PATH)
 
 # Base directory for resolving script paths

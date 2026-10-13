@@ -15,7 +15,7 @@ This repository extends the [DART-GUI](https://github.com/computer-use-agents/da
 
 Process rewards are produced while rollouts are collected, then consumed by the asynchronous trainer.
 
-* Rollout scoring lives in `dart_rollouter/src/core/trajectory_runner.py`, with grouping and the two-level critic in `dart_rollouter/src/core/`.
+* Rollout scoring lives in `dart_rollouter/src/core/trajectory_runner_uitars.py` and `trajectory_runner_qwen3.py`, selected by `runner.protocol`. Grouping and the two-level critic are in `dart_rollouter/src/core/`.
 * The trainer reads those scores in `verl/trainer/ppo/ray_trainer_async.py`.
 * The training entry is `examples/osworld/async/debug.sh`.
 
@@ -82,8 +82,9 @@ Put the same host, user, password, and database in `dart_rollouter/config/config
 
 Inside the rollout container, edit `dart_rollouter/config/config.yaml`:
 
-* `model.ckpt_path`
-* `model.service_port` and `model.service_endpoint`
+* `runner.protocol` (`uitars` or `qwen3`)
+* `model.ckpt_path`, `model.service_endpoint`
+* `process_reward.backend` (`original` for the paper setting) and `process_reward.model`
 * `storage.root`, which must match `ROLLOUTER_DATA_DIR` / `RUN_ID` used by the trainer
 * `mysql.*`
 

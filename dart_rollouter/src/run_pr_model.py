@@ -35,13 +35,20 @@ def main(cfg: DictConfig):
     # 打印解析后的配置
     logger.info(OmegaConf.to_yaml(cfg))
 
-    # 创建 ModelConfig，直接从 Hydra 的配置对象中获取值
+    backend = str(cfg.process_reward.backend).lower()
+    if backend not in {"original", "seekjudge"}:
+        raise ValueError(
+            "process_reward.backend must be original or seekjudge when starting a PR model service"
+        )
+    active_model = cfg.process_reward.model
+
+    # 创建 ModelConfig，直接从当前 PR 后端的模型配置中获取值
     model_cfg = ModelConfig(
-        ckpt_path=cfg.pr_model.ckpt_path,
-        base_port=cfg.pr_model.base_port,
-        replicas=cfg.pr_model.replicas,
-        vllm_params=OmegaConf.to_container(cfg.pr_model.vllm_params),
-        save_local=cfg.pr_model.save_local,
+        ckpt_path=active_model.ckpt_path,
+        base_port=active_model.base_port,
+        replicas=active_model.replicas,
+        vllm_params=OmegaConf.to_container(active_model.vllm_params),
+        save_local=active_model.save_local,
         save_path=cfg.storage.root
     )
 
@@ -97,8 +104,7 @@ def main(cfg: DictConfig):
             messages=request.messages,
             reward=request.reward,
             task_id=request.task_id,
-            trace_id=request.trace_id,
-            parsed_actions=request.parsed_actions,
+            trace_id=request.trace_id
         )
 
     @app.post("/reload", summary="Reload model with rolling update")
@@ -158,7 +164,7 @@ def main(cfg: DictConfig):
         checkpoint_info = await pool.get_checkpoint_info()
         return checkpoint_info
     
-    uvicorn.run(app, host=cfg.pr_model.host, port=cfg.pr_model.service_port)
+    uvicorn.run(app, host=active_model.host, port=active_model.service_port)
 
 
 if __name__ == "__main__":

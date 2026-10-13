@@ -1,5 +1,8 @@
 import os
+import fcntl
 import logging
+import tempfile
+import zipfile
 from typing import Dict, List, Set
 from typing import Optional, Any, Union
 from datetime import datetime
@@ -7,6 +10,61 @@ import requests
 import pandas as pd
 
 logger = logging.getLogger("desktopenv.getter.file")
+
+
+_OFFICE_PACKAGE_EXTENSIONS = {".docx", ".pptx", ".xlsx"}
+
+
+def _is_valid_cached_file(path: str) -> bool:
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return False
+
+    if os.path.splitext(path)[1].lower() not in _OFFICE_PACKAGE_EXTENSIONS:
+        return True
+
+    if not zipfile.is_zipfile(path):
+        return False
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return archive.testzip() is None
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
+def _download_to_cache(url: str, target_path: str) -> None:
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    lock_path = f"{target_path}.lock"
+
+    with open(lock_path, "a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        if _is_valid_cached_file(target_path):
+            return
+
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=os.path.dirname(target_path),
+                prefix=f".{os.path.basename(target_path)}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temp_file:
+                temp_path = temp_file.name
+                response = requests.get(url, stream=True, timeout=(10, 300))
+                response.raise_for_status()
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        temp_file.write(chunk)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+
+            if not _is_valid_cached_file(temp_path):
+                raise ValueError(f"Downloaded file is invalid: {url}")
+            os.replace(temp_path, target_path)
+            temp_path = None
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
 
 
 def get_content_from_vm_file(env, config: Dict[str, Any]) -> Any:
@@ -51,22 +109,11 @@ def get_cloud_file(env, config: Dict[str, Any]) -> Union[str, List[str]]:
     gives: Set[int] = set(config.get("gives", [0]))
 
     for i, (p, d) in enumerate(zip(paths, dests)):
-        _path = os.path.join(env.cache_dir, d)
+        _path = os.path.abspath(os.path.join(env.cache_dir, d))
         if i in gives:
             cache_paths.append(_path)
 
-        if os.path.exists(_path):
-            #return _path
-            continue
-
-        url = p
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-
-        with open(_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+        _download_to_cache(p, _path)
 
     return cache_paths[0] if len(cache_paths)==1 else cache_paths
 

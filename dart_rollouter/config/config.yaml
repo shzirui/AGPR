@@ -1,0 +1,88 @@
+task:
+  task_file: "evaluation_examples/trainset_new_181.json"
+  osworld_root: "evaluation_examples/examples_new"
+  resume: False
+
+storage:
+  root: &root "results/osworld_rollout"
+
+model:
+  ckpt_path: &default_ckpt_path "/path/to/UI-TARS-1.5-7B"
+  replicas: 2
+  base_port: 8000
+  host: "127.0.0.1"
+  service_port: 15959
+  service_endpoint: "http://127.0.0.1:15959"
+  save_local: True
+
+  vllm_params:
+    gpu_memory_utilization: 0.9
+
+process_reward:
+  backend: "original"  # disabled | original | seekjudge
+  release_env_before_evaluation: True
+  max_concurrent_jobs: 8
+  mode: "multi"
+  enable_phase3: True
+  loop_limit: 8
+  preprocess_concurrency: 8
+  max_retries: 3
+  model:
+    served_model: "Qwen3.6-27B"
+    ckpt_path: "/path/to/Qwen3.6-27B"
+    replicas: 2
+    base_port: 8000
+    host: "127.0.0.1"
+    service_port: 15959
+    service_endpoint:
+      - "http://127.0.0.1:8010"
+      - "http://127.0.0.1:8020"
+    save_local: False
+    vllm_params:
+      gpu_memory_utilization: 0.9
+
+coordinator:
+  max_concurrent_envs: 8
+  max_task_queue_size: 1000
+  rollout_n: &rollout_n 8
+
+runner:
+  protocol: uitars  # qwen3 | uitars
+  max_steps: 30
+  max_images: 5
+  max_texts: 35
+  qwen3_image_max: 10
+  qwen3_fold_size: 1
+  write_to_mysql: True
+  rollout_n: *rollout_n
+  root: *root
+  qwen3_enable_thinking: False
+
+  env:
+    max_retries: 3
+    action_space: "pyautogui"
+    screen_size: (1920, 1080)
+    headless: True
+    os_type: "Ubuntu"
+    require_a11y_tree: False
+    provider_name: "docker_server"
+
+  model_pool:
+    timeout: 100
+    retries: 10
+    backoff: 2
+    frequency_penalty: 1
+    temperature: 0.7
+    top_p: 1
+    max_tokens: 500
+    seed: 1
+    ckpt_path: *default_ckpt_path
+    logprobs: True
+    return_tokens_as_token_ids: True
+
+mysql:
+  username: "root"
+  password: "CHANGE_ME"
+  host: "127.0.0.1"
+  port: 3306
+  database: "dart"

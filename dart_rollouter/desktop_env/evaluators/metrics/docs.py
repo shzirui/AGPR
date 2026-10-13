@@ -1186,7 +1186,7 @@ def compare_unique_train_records(processed_file, expected_files, **kwargs):
     return 1
 
 if __name__ == "__main__":
-    image_path = "/home/ubuntu/OSWorld/cache/02ce9a50-7af2-47ed-8596-af0c230501f8/ls.png"
+    image_path = "/path/to/ls.png"
     print(compare_image_text(image_path, {
         "type": "text",
         "text": "ls"

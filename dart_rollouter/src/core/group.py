@@ -5,6 +5,23 @@ import time
 from openai import OpenAI
 from typing import List, Dict, Optional
 
+try:
+    from .prm_validation import (
+        PRM_MAX_ATTEMPTS,
+        PRMValidationError,
+        validate_grouped_step_coverage,
+        validate_grouping,
+        validation_feedback,
+    )
+except ImportError:
+    from prm_validation import (
+        PRM_MAX_ATTEMPTS,
+        PRMValidationError,
+        validate_grouped_step_coverage,
+        validate_grouping,
+        validation_feedback,
+    )
+
 # ================= 配置区域 =================
 
 # 1. 原始数据根目录
@@ -78,7 +95,10 @@ async def async_group_steps(
     ## Trajectory Steps
     {steps_text}
 
-    Analyze the steps and group them. Return ONLY JSON.
+    Analyze the steps and group them. The groups MUST cover every step from
+    Step 1 through Step {len(steps)} exactly once, in order, with no gaps or
+    overlaps. Include a final finished/DONE/FAIL step in the last group when
+    one is present. Return ONLY JSON.
     """
 
     messages = [
@@ -86,33 +106,37 @@ async def async_group_steps(
         {"role": "user", "content": user_prompt}
     ]
 
-    # 2. 调用外部传入的异步 LLM 方法
-    json_result_str = await async_call_llm_fn(messages)
-    
-    if not json_result_str:
-        return []
+    # 2. 调用 LLM；结构错误时反馈具体错误并重试，最多总计 3 次。
+    last_error = None
+    for attempt in range(1, PRM_MAX_ATTEMPTS + 1):
+        attempt_messages = messages + ([validation_feedback(last_error)] if last_error else [])
+        json_result_str = await async_call_llm_fn(attempt_messages)
 
-    # 3. 解析与强制切分 (原汁原味复用你原来的核心逻辑)
-    enriched_subgoals = []
-    try:
-        json_result_str = clean_json_response(json_result_str)
-        subgoals_structure = json.loads(json_result_str)
+        try:
+            if not json_result_str:
+                raise PRMValidationError("grouping response must not be empty")
+            subgoals_structure = validate_grouping(
+                json.loads(clean_json_response(json_result_str)), len(steps)
+            )
+
+            # 3. 解析与强制切分 (原汁原味复用你原来的核心逻辑)
+            enriched_subgoals = []
         
-        for item in subgoals_structure:
-            original_start = int(item.get('start_step', 1))
-            original_end = int(item.get('end_step', 1))
+            for item in subgoals_structure:
+                original_start = item['start_step']
+                original_end = item['end_step']
             
-            steps_count = original_end - original_start + 1
-            should_split = ENABLE_FORCE_SPLIT and (steps_count > MAX_STEPS_LIMIT)
+                steps_count = original_end - original_start + 1
+                should_split = ENABLE_FORCE_SPLIT and (steps_count > MAX_STEPS_LIMIT)
             
-            if not should_split:
+                if not should_split:
                 # === 不切分 ===
-                start_idx = max(0, original_start - 1)
-                end_idx = min(len(steps), original_end)
+                    start_idx = original_start - 1
+                    end_idx = original_end
                 
-                if start_idx < len(steps):
+                    if start_idx < len(steps):
                     # 构建当前组的基本 Steps
-                    current_segment = [
+                        current_segment = [
                         {
                             "step_idx": s['step_id'],
                             "content": s['raw_content'],
@@ -120,36 +144,36 @@ async def async_group_steps(
                             "next_image": get_next_image_filename(s['image_file'])
                         } 
                         for s in steps[start_idx : end_idx]
-                    ]
+                        ]
 
                     # 如果有上一步，插到最前面
-                    if start_idx > 0:
-                        prev_s = steps[start_idx - 1]
-                        context_step = {
+                        if start_idx > 0:
+                            prev_s = steps[start_idx - 1]
+                            context_step = {
                             "step_idx": prev_s['step_id'],
                             "content": f"[PREVIOUS CONTEXT] {prev_s['raw_content']}", 
                             "image": prev_s['image_file'],
                             "next_image": get_next_image_filename(prev_s['image_file'])
-                        }
-                        item['steps_data'] = [context_step] + current_segment
-                    else:
-                        item['steps_data'] = current_segment
+                            }
+                            item['steps_data'] = [context_step] + current_segment
+                        else:
+                            item['steps_data'] = current_segment
 
-                    enriched_subgoals.append(item)
-            else:
+                        enriched_subgoals.append(item)
+                else:
                 # === 需要切分 ===
-                current_chunk_start = original_start
-                part_counter = 1
+                    current_chunk_start = original_start
+                    part_counter = 1
                 
-                while current_chunk_start <= original_end:
-                    current_chunk_end = min(current_chunk_start + MAX_STEPS_LIMIT - 1, original_end)
+                    while current_chunk_start <= original_end:
+                        current_chunk_end = min(current_chunk_start + MAX_STEPS_LIMIT - 1, original_end)
                     
-                    chunk_start_idx = max(0, current_chunk_start - 1)
-                    chunk_end_idx = min(len(steps), current_chunk_end)
+                        chunk_start_idx = current_chunk_start - 1
+                        chunk_end_idx = current_chunk_end
                     
-                    if chunk_start_idx < chunk_end_idx:
+                        if chunk_start_idx < chunk_end_idx:
                         # 构建当前组的基本 Steps
-                        current_segment = [
+                            current_segment = [
                             {
                                 "step_idx": s['step_id'],
                                 "content": s['raw_content'],
@@ -157,37 +181,39 @@ async def async_group_steps(
                                 "next_image": get_next_image_filename(s['image_file'])
                             } 
                             for s in steps[chunk_start_idx : chunk_end_idx]
-                        ]
+                            ]
 
                         # 如果有上一步，插到最前面
-                        final_segment_data = current_segment
-                        if chunk_start_idx > 0:
-                            prev_s = steps[chunk_start_idx - 1]
-                            context_step = {
+                            final_segment_data = current_segment
+                            if chunk_start_idx > 0:
+                                prev_s = steps[chunk_start_idx - 1]
+                                context_step = {
                                 "step_idx": prev_s['step_id'],
                                 "content": f"[PREVIOUS CONTEXT] {prev_s['raw_content']}",
                                 "image": prev_s['image_file'],
                                 "next_image": get_next_image_filename(prev_s['image_file'])
-                            }
-                            final_segment_data = [context_step] + current_segment
+                                }
+                                final_segment_data = [context_step] + current_segment
 
-                        new_item = item.copy()
-                        new_item['subgoal_name'] = f"{item['subgoal_name']} (Part {part_counter})"
-                        new_item['start_step'] = current_chunk_start
-                        new_item['end_step'] = current_chunk_end
-                        new_item['reasoning'] = f"{item.get('reasoning','')} [Auto-split]"
-                        new_item['steps_data'] = final_segment_data
+                            new_item = item.copy()
+                            new_item['subgoal_name'] = f"{item['subgoal_name']} (Part {part_counter})"
+                            new_item['start_step'] = current_chunk_start
+                            new_item['end_step'] = current_chunk_end
+                            new_item['reasoning'] = f"{item.get('reasoning','')} [Auto-split]"
+                            new_item['steps_data'] = final_segment_data
                         
-                        enriched_subgoals.append(new_item)
+                            enriched_subgoals.append(new_item)
                     
-                    current_chunk_start = current_chunk_end + 1
-                    part_counter += 1
-                    
-    except json.JSONDecodeError as e:
-        # 这里你可以把日志抛给上层，或者直接 print
-        print(f"JSON 解析失败: {e}")
-    except Exception as e:
-        print(f"分组逻辑出错: {e}")
+                        current_chunk_start = current_chunk_end + 1
+                        part_counter += 1
 
-    return enriched_subgoals
+            validate_grouped_step_coverage(enriched_subgoals, len(steps))
+            return enriched_subgoals
+        except (json.JSONDecodeError, PRMValidationError, KeyError, TypeError, ValueError) as error:
+            last_error = error
+            print(
+                f"[PRM Grouping] validation failed on attempt "
+                f"{attempt}/{PRM_MAX_ATTEMPTS}: {error}"
+            )
 
+    return []

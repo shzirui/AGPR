@@ -9,24 +9,26 @@ from dataclasses import dataclass, asdict
 import copy
 import logging
 import random
+import shutil
 
 # Import required modules
 from src.core.prompts import COMPUTER_USE_PROMPT, COMPUTER_USE_PROMPT_WITH_CALL_USER
 from src.utils.log_config import setup_logging
-from src.services.mysql_rollout import MySQLRolloutORM, DB_CONFIG
+# from src.services.mysql_rollout import MySQLRolloutORM, DB_CONFIG
 
 # Setup unified logging system
 setup_logging()
 logger = logging.getLogger(__name__)
 
 class TaskLoader:
-    def __init__(self, task_cfg: DictConfig, storage_root):
+    def __init__(self, task_cfg: DictConfig, storage_root, rollout_n: int = 1):
         self.task_file = Path(task_cfg.task_file)
         self.osworld_root = Path(task_cfg.osworld_root)
         
         self._latest_sha: Optional[str] = None
         self.storage_root = storage_root
         self.resume = task_cfg.resume
+        self.rollout_n = rollout_n
         
         # Dynamic rollout_n related parameters
         self.success_rate_threshold = getattr(task_cfg, 'success_rate_threshold', 1.0)  # Success rate threshold
@@ -82,22 +84,26 @@ class TaskLoader:
         ]
         
         if self.resume:
-            # Filter completed or mismatched tasks
+            # Keep tasks whose completed rollout count has not reached rollout_n.
             filtered_tasks = []
             storage_root = Path(self.storage_root)
+            self._cleanup_invalid_resume_dirs(storage_root)
+            remaining_rollouts_total = 0
 
             for raw in raw_tasks:
                 task_id = str(raw["task_id"])
                 task_type_expected = raw["task_type"]
 
                 # Find all subdirectories starting with task_id (allow multiple versions)
-                candidate_dirs = [
-                    d for d in storage_root.iterdir()
-                    if d.is_dir() and d.name.startswith(task_id)
-                ]
+                if storage_root.is_dir():
+                    candidate_dirs = [
+                        d for d in storage_root.iterdir()
+                        if d.is_dir() and d.name.startswith(task_id)
+                    ]
+                else:
+                    candidate_dirs = []
 
-                # Default to assuming task is not finished
-                task_finished = False
+                completed_rollouts = 0
 
                 for d in candidate_dirs:
                     cfg_path = d / "task_config.json"
@@ -116,22 +122,77 @@ class TaskLoader:
                     if cfg.get("raw", {}).get("task_type") != task_type_expected:
                         continue
 
-                    # 3.2 If task_type matches, check reward.txt
-                    if (d / "reward.txt").exists():
-                        task_finished = True
-                        break  # Found completion record, no need to check other directories
+                    # 3.2 If task_type matches, count non-empty reward.txt as a completed rollout.
+                    reward_path = d / "reward.txt"
+                    if reward_path.exists() and reward_path.stat().st_size > 0:
+                        completed_rollouts += 1
                         
-                if not task_finished:
-                    filtered_tasks.append(raw)
+                pending_rollouts = max(0, self.rollout_n - completed_rollouts)
+                if pending_rollouts > 0:
+                    raw_with_resume = copy.deepcopy(raw)
+                    raw_with_resume["completed_rollouts"] = completed_rollouts
+                    raw_with_resume["pending_rollouts"] = pending_rollouts
+                    filtered_tasks.append(raw_with_resume)
+                    remaining_rollouts_total += pending_rollouts
                     
             self._tasks = [build_task(raw, self.osworld_root) for raw in filtered_tasks]
-            print(f"Total number of tasks: {len(raw_tasks)}, Remaining: {len(filtered_tasks)}")
+            print(
+                f"Total number of tasks: {len(raw_tasks)}, "
+                f"Remaining tasks: {len(filtered_tasks)}, "
+                f"Remaining rollouts: {remaining_rollouts_total}"
+            )
 
         else:
             self._tasks = [build_task(raw, self.osworld_root) for raw in raw_tasks]
             print(f"Total number of tasks: {len(raw_tasks)}")
 
         return True
+
+    def _cleanup_invalid_resume_dirs(self, storage_root: Path):
+        """Remove incomplete or invalid trajectories before resume accounting."""
+        if not storage_root.is_dir():
+            return
+
+        cleanup_counts = {
+            "missing_reward": 0,
+            "empty_reward": 0,
+            "invalid_reward": 0,
+            "negative_reward": 0,
+        }
+
+        for child in storage_root.iterdir():
+            if not child.is_dir():
+                continue
+
+            reward_path = child / "reward.txt"
+            reason = None
+
+            if not reward_path.exists():
+                reason = "missing_reward"
+            else:
+                text = reward_path.read_text(errors="replace").strip()
+                if not text:
+                    reason = "empty_reward"
+                else:
+                    try:
+                        reward = float(text)
+                    except Exception:
+                        reason = "invalid_reward"
+                    else:
+                        if reward < 0:
+                            reason = "negative_reward"
+
+            if reason:
+                shutil.rmtree(child)
+                cleanup_counts[reason] += 1
+
+        total_removed = sum(cleanup_counts.values())
+        if total_removed:
+            print(
+                "Resume cleanup removed "
+                f"{total_removed} directories from {storage_root}: "
+                f"{cleanup_counts}"
+            )
         
     def _find_latest_json(self) -> Optional[Path]:
         files = list(self.task_root.glob("*.json"))
@@ -206,6 +267,8 @@ class TaskInfo:
     messages: List
     instruction: str
     task_config: Dict
+    completed_rollouts: int = 0
+    pending_rollouts: Optional[int] = None
 
     def to_dict(self):
         return asdict(self)
@@ -253,7 +316,9 @@ def build_task(raw: Dict, osworld_root: Path, use_call_user: bool = False) -> Ta
     return TaskInfo(
         messages = messages,
         instruction = instruction,
-        task_config = task_data
+        task_config = task_data,
+        completed_rollouts = raw.get("completed_rollouts", 0),
+        pending_rollouts = raw.get("pending_rollouts")
     )
 
 def hf_processor(name_or_path, **kwargs):
@@ -316,7 +381,7 @@ def process_system_prompt(instruction_root='evaluation_examples/examples_new'):
         instruction_root (str): Root directory containing instruction JSON files
     """
     # Assume hf_processor and COMPUTER_USE_PROMPT are already defined
-    processor = hf_processor('/workspace/models/UI-TARS-1.5-7B', trust_remote_code=True, use_fast=True)
+    processor = hf_processor('ByteDance-Seed/UI-TARS-1.5', trust_remote_code=True, use_fast=True)
     system_prompt = COMPUTER_USE_PROMPT  
     
     # --- Modification 1: Define output file path ---

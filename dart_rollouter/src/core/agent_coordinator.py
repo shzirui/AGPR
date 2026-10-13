@@ -7,9 +7,19 @@ import uuid
 import os
 import json
 from typing import List, Dict, Set, Optional
-from src.core.trajectory_runner import TrajectoryRunnerActor, ResourceExhaustedException
 from src.utils.log_config import setup_logging
 from datetime import datetime
+
+
+def _load_runner(protocol: str):
+    name = str(protocol or "qwen3").strip().lower()
+    if name in {"qwen3", "qwen3vl", "qwen"}:
+        from src.core.trajectory_runner_qwen3 import TrajectoryRunnerActor, ResourceExhaustedException
+    elif name in {"uitars", "ui-tars", "ui_tars", "original"}:
+        from src.core.trajectory_runner_uitars import TrajectoryRunnerActor, ResourceExhaustedException
+    else:
+        raise ValueError(f"Unknown runner.protocol={protocol!r}; expected qwen3 or uitars")
+    return TrajectoryRunnerActor, ResourceExhaustedException
 
 # Setup unified logging system
 setup_logging()
@@ -20,12 +30,16 @@ class AgentCoordinator:
     def __init__(self, coordinator_cfg):
         self.max_concurrent_envs = coordinator_cfg.max_concurrent_envs  # Maximum concurrent environments
         self.active_tasks: Set[ray.ObjectRef] = set()  # Track running tasks
+        self.active_pr_tasks: Set[asyncio.Task] = set()  # Deferred PR tasks, outside VM slots
+        self.max_concurrent_pr_jobs = 2
+        self.pr_semaphore = asyncio.Semaphore(self.max_concurrent_pr_jobs)
         self.task_queue = asyncio.Queue()  # Remove queue size limit
         self.task_trace_map: Dict[ray.ObjectRef, str] = {}  # Map task reference to trace_id
         self.poll_count = 0  # Track number of times tasks have been fetched
         self.max_task_queue_size = coordinator_cfg.max_task_queue_size  # Maximum number of times to fetch tasks from task_loader
         self.rollout_n = getattr(coordinator_cfg, 'rollout_n', 1)  # Number of repetitions per task, default is 1
         self.dynamic_rollout = getattr(coordinator_cfg, 'dynamic_rollout', False)  # Whether to enable dynamic rollout_n
+        self.max_failure_retries = int(getattr(coordinator_cfg, 'max_failure_retries', 8))
         
         # Environment cleanup related
         self.env_cleanup_interval = getattr(coordinator_cfg, 'env_cleanup_interval', 10)  # Environment cleanup interval (seconds)
@@ -47,6 +61,8 @@ class AgentCoordinator:
             'start_time': time.time()
         }
         
+        self.RunnerActor = None
+        self.ResourceExhaustedException = None
         logger.info(f"AgentCoordinator initialized - Max concurrent environments: {self.max_concurrent_envs}, Max task fetches: {self.max_task_queue_size} times, rollout_n: {self.rollout_n}")
         logger.info(f"Environment cleanup config - Cleanup interval: {self.env_cleanup_interval} seconds, Cleanup timeout: {self.env_cleanup_timeout} seconds")
         
@@ -88,8 +104,27 @@ class AgentCoordinator:
         # we need to record at task startup and remove at task completion
         pass
 
-    async def start_rollout(self, task_loader, runner_cfg, model_pool, storage, mysql_writer, pr_model_pool=None):
+    async def start_rollout(
+        self,
+        task_loader,
+        runner_cfg,
+        model_pool,
+        storage,
+        mysql_writer,
+        pr_model_pool=None,
+        process_reward_cfg=None,
+    ):
         """Main loop: continuously process tasks"""
+        protocol = getattr(runner_cfg, "protocol", "qwen3")
+        self.RunnerActor, self.ResourceExhaustedException = _load_runner(protocol)
+        logger.info(f"Using runner protocol={protocol} actor={self.RunnerActor}")
+        release_env_before_pr = bool(
+            getattr(process_reward_cfg, "release_env_before_evaluation", False)
+        )
+        self.max_concurrent_pr_jobs = max(
+            1, int(getattr(process_reward_cfg, "max_concurrent_jobs", 2))
+        )
+        self.pr_semaphore = asyncio.Semaphore(self.max_concurrent_pr_jobs)
         # Ensure exception handler is set (now event loop is running)
         try:
             loop = asyncio.get_running_loop()
@@ -112,6 +147,7 @@ class AgentCoordinator:
                             await asyncio.wait(self.active_tasks, timeout=60.0)  # Wait maximum 60 seconds
                         except asyncio.TimeoutError:
                             logger.warning("Timeout waiting for tasks to complete, force exit")
+                    await self._wait_for_pr_tasks()
                     logger.info("Graceful exit completed")
                     break
                 
@@ -134,12 +170,17 @@ class AgentCoordinator:
                                                 
                         for task in sorted_tasks:
                             task_id = task.get('task_config', {}).get('raw', {}).get('task_id', 'unknown')
-                            
+                            pending_rollouts = task.get('pending_rollouts')
+
                             if self.dynamic_rollout:
                                 # Get dynamic rollout_n value
                                 traj_counts, success_rate, dynamic_rollout_n = task_loader.get_dynamic_rollout_n(task_id, self.rollout_n) # Tasks with success rate above threshold will also be sampled, monitored in real-time, and if success rate falls below threshold, will resample self.rollout_n trajectories
                             else:
                                 dynamic_rollout_n = self.rollout_n
+
+                            if pending_rollouts is not None:
+                                dynamic_rollout_n = min(dynamic_rollout_n, pending_rollouts)
+
                             # Create dynamic_rollout_n copies for each task
                             for rollout_idx in range(dynamic_rollout_n):
                                 task_with_trace = copy.deepcopy(task)
@@ -175,14 +216,30 @@ class AgentCoordinator:
                         logger.info(f"[{trace_id}] Starting task - task_id: {task_id}, rollout_idx: {rollout_idx + 1}/{dynamic_rollout_n}")
                             
                         try:
-                            actor = TrajectoryRunnerActor.options(num_cpus=0.5).remote(task_info, runner_cfg)
+                            actor_cpus = 0 if (release_env_before_pr and pr_model_pool) else 0.5
+                            actor = self.RunnerActor.options(num_cpus=actor_cpus).remote(
+                                task_info, runner_cfg, process_reward_cfg
+                            )
                             task_ref = actor.run_episode.remote(model_pool, storage, mysql_writer, pr_model_pool)
                             self.active_tasks.add(task_ref)
                             self.task_trace_map[task_ref] = trace_id
                             self.task_to_actor_map[task_ref] = actor  # Save Actor reference
                             
                             # Asynchronously track task completion and service_id management
-                            task_completion = asyncio.create_task(self._track_task_completion(task_ref, task_id, trace_id, rollout_idx))
+                            task_completion = asyncio.create_task(
+                                self._track_task_completion(
+                                    task_ref,
+                                    task_info,
+                                    task_id,
+                                    trace_id,
+                                    rollout_idx,
+                                    release_env_before_pr,
+                                    model_pool,
+                                    storage,
+                                    mysql_writer,
+                                    pr_model_pool,
+                                )
+                            )
                             # Get service_id
                             asyncio.create_task(self._track_service_id(task_ref, actor))
                             # Only add exception handling callback to task_completion to avoid duplicate processing
@@ -229,6 +286,7 @@ class AgentCoordinator:
                     elif (self.task_queue.empty() and 
                           self.poll_count >= self.max_task_queue_size):
                         logger.info("All tasks completed, preparing to exit")
+                        await self._wait_for_pr_tasks()
                         break
                     
                     await asyncio.sleep(0.1)
@@ -244,12 +302,54 @@ class AgentCoordinator:
                 break
         
         # Main loop ended, print final statistics
+        await self._wait_for_pr_tasks()
         self._log_stats()
         logger.info("Task processing loop ended")
         return True  # Return completion status
 
-    async def _track_task_completion(self, task_ref: ray.ObjectRef, task_id: str, trace_id: str, rollout_idx: int):
+    def _unwrap_task_error(self, exc: BaseException) -> BaseException:
+        cause = getattr(exc, "cause", None)
+        return cause if isinstance(cause, BaseException) else exc
+
+    async def _requeue_failed_task(self, task_info: Dict, error: BaseException, wait_seconds: float = 0.0):
+        retries = int(task_info.get("failure_retries", 0))
+        task_id = task_info.get("task_config", {}).get("raw", {}).get("task_id", "unknown")
+        if retries >= self.max_failure_retries:
+            self.stats["total_failed"] += 1
+            logger.error(
+                f"Giving up after {retries} retries - task_id: {task_id}, Error: {error}"
+            )
+            return
+        retry_info = copy.deepcopy(task_info)
+        retry_info["failure_retries"] = retries + 1
+        retry_info["trace_id"] = self._generate_trace_id()
+        if wait_seconds > 0:
+            logger.info(
+                f"Waiting {wait_seconds:.0f}s before requeue - task_id: {task_id}, "
+                f"retry {retry_info['failure_retries']}/{self.max_failure_retries}"
+            )
+            await asyncio.sleep(wait_seconds)
+        await self.task_queue.put(retry_info)
+        logger.info(
+            f"[{retry_info['trace_id']}] Requeued failed task - task_id: {task_id}, "
+            f"retry {retry_info['failure_retries']}/{self.max_failure_retries}"
+        )
+
+    async def _track_task_completion(
+        self,
+        task_ref: ray.ObjectRef,
+        task_info: Dict,
+        task_id: str,
+        trace_id: str,
+        rollout_idx: int,
+        release_env_before_pr: bool,
+        model_pool,
+        storage,
+        mysql_writer,
+        pr_model_pool,
+    ):
         """Track task completion status"""
+        actor_for_deferred_pr = None
         try:
             start_time = time.time()
             task_failed = False  # Mark if task failed
@@ -259,29 +359,54 @@ class AgentCoordinator:
                 duration = time.time() - start_time
                 self.stats['total_completed'] += 1
                 logger.info(f"[{trace_id}] Task executed successfully - task_id: {task_id}, rollout_idx: {rollout_idx + 1}/{self.rollout_n}, Duration: {duration:.2f} seconds")
-                
-            except ResourceExhaustedException as e:
-                # Detected resource exhaustion exception, set graceful exit flag
-                task_failed = True
-                duration = time.time() - start_time
-                self.stats['total_failed'] += 1
-                self.should_graceful_exit = True
-                self.exit_reason = f"Environment server resources have reached limit"
-                logger.error(f"[{trace_id}] Detected resource exhaustion exception, initiating graceful exit process - task_id: {task_id}, Duration: {duration:.2f} seconds, Error: {e}")
+
+                # In two-stage mode the runner has already released its VM.
+                # Keep its actor only while the independent PR post-process runs.
+                if (
+                    release_env_before_pr
+                    and isinstance(result, dict)
+                    and result.get("defer_pr")
+                ):
+                    actor_for_deferred_pr = self.task_to_actor_map.get(task_ref)
+                    if actor_for_deferred_pr is not None:
+                        self._enqueue_deferred_pr(
+                            actor_for_deferred_pr,
+                            result["data"],
+                            pr_model_pool,
+                            storage,
+                            mysql_writer,
+                            trace_id,
+                            task_id,
+                        )
                 
             except BaseException as e:
-                # Handle all other exceptions (including Exception and system-level exceptions like KeyboardInterrupt)
                 task_failed = True
                 duration = time.time() - start_time
+                original = self._unwrap_task_error(e)
+                err_s = str(original).lower() + str(e).lower()
+                no_vm = (
+                    isinstance(e, self.ResourceExhaustedException)
+                    or isinstance(original, self.ResourceExhaustedException)
+                    or "quota" in err_s
+                    or "failed to start emulator" in err_s
+                )
                 if isinstance(e, Exception):
-                    self.stats['total_failed'] += 1
-                    # Show error type and brief info, but not full stack
-                    error_type = type(e).__name__
-                    error_msg = str(e)  # Limit error message length
-                    logger.error(f"[{trace_id}] Task execution failed - task_id: {task_id}, rollout_idx: {rollout_idx + 1}/{self.rollout_n}, Duration: {duration:.2f} seconds, Error: {error_type}: {error_msg}")
-                    logger.info(f"[{trace_id}] Full exception details: {e}")
-                    
-                    # Force terminate failed Actor to prevent infinite loop
+                    error_type = type(original).__name__
+                    error_msg = str(original)
+                    if no_vm:
+                        logger.warning(
+                            f"[{trace_id}] No VM available, will requeue instead of exiting - "
+                            f"task_id: {task_id}, Duration: {duration:.2f} seconds, Error: {error_msg}"
+                        )
+                        await self._requeue_failed_task(task_info, original, wait_seconds=20.0)
+                    else:
+                        logger.error(
+                            f"[{trace_id}] Task execution failed - task_id: {task_id}, "
+                            f"rollout_idx: {rollout_idx + 1}/{self.rollout_n}, Duration: {duration:.2f} seconds, "
+                            f"Error: {error_type}: {error_msg}"
+                        )
+                        await self._requeue_failed_task(task_info, original)
+
                     actor = self.task_to_actor_map.get(task_ref)
                     if actor:
                         try:
@@ -297,7 +422,19 @@ class AgentCoordinator:
                     # 1. Resource cleanup: Remove from active task set
                     self.active_tasks.discard(task_ref)
                     self.task_trace_map.pop(task_ref, None)
-                    self.task_to_actor_map.pop(task_ref, None)  # Clean up Actor reference
+                    actor = self.task_to_actor_map.pop(task_ref, None)  # Clean up Actor reference
+
+                    # The deferred PR coroutine owns the actor in the two-stage case.
+                    if (
+                        release_env_before_pr
+                        and actor is not None
+                        and actor_for_deferred_pr is None
+                    ):
+                        try:
+                            ray.kill(actor)
+                            logger.info(f"[{trace_id}] Sampling actor released")
+                        except Exception as kill_error:
+                            logger.warning(f"[{trace_id}] Failed to release sampling actor: {kill_error}")
                     
                     # Remove from active service_id list
                     service_id = self.task_to_service_map.pop(task_ref, None)
@@ -319,6 +456,75 @@ class AgentCoordinator:
             logger.error(f"[{trace_id}] _track_task_completion method interrupted by system-level exception: {system_error}")
         
         # Note: Resource cleanup has been handled in inner finally block
+
+    def _enqueue_deferred_pr(
+        self,
+        actor,
+        deferred_data,
+        pr_model_pool,
+        storage,
+        mysql_writer,
+        trace_id: str,
+        task_id: str,
+    ):
+        """Schedule PR work without counting it against environment concurrency."""
+        pr_task = asyncio.create_task(
+            self._run_deferred_pr(
+                actor,
+                deferred_data,
+                pr_model_pool,
+                storage,
+                mysql_writer,
+                trace_id,
+                task_id,
+            )
+        )
+        self.active_pr_tasks.add(pr_task)
+        pr_task.add_done_callback(self._handle_pr_task_done)
+
+    async def _run_deferred_pr(
+        self,
+        actor,
+        deferred_data,
+        pr_model_pool,
+        storage,
+        mysql_writer,
+        trace_id: str,
+        task_id: str,
+    ):
+        await self.pr_semaphore.acquire()
+        try:
+            logger.info(f"[{trace_id}] Starting deferred PR task - task_id: {task_id}")
+            await actor.run_pr_postprocess.remote(
+                deferred_data,
+                pr_model_pool,
+                storage,
+                mysql_writer,
+            )
+            logger.info(f"[{trace_id}] Deferred PR task completed - task_id: {task_id}")
+        except Exception as e:
+            logger.error(f"[{trace_id}] Deferred PR task failed - task_id: {task_id}, Error: {e}")
+        finally:
+            self.pr_semaphore.release()
+            try:
+                ray.kill(actor)
+            except Exception as e:
+                logger.warning(f"[{trace_id}] Failed to release deferred PR actor: {e}")
+
+    def _handle_pr_task_done(self, task):
+        self.active_pr_tasks.discard(task)
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Deferred PR task callback failed: {e}")
+
+    async def _wait_for_pr_tasks(self):
+        if not self.active_pr_tasks:
+            return
+        logger.info(f"Waiting for {len(self.active_pr_tasks)} deferred PR tasks to complete...")
+        await asyncio.gather(*list(self.active_pr_tasks), return_exceptions=True)
 
     async def _track_service_id(self, task_ref: ray.ObjectRef, actor):
         """Track task's service_id"""

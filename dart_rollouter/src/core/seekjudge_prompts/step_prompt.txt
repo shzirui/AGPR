@@ -1,0 +1,228 @@
+# Step-Level Analysis: 9-Category Per-Transition Classification
+
+Before outputting results, follow this analysis process:
+
+**Step A: Goal Decomposition** — List each sub-goal the agent must achieve. Each sub-goal should correspond to a **user-visible outcome** that directly satisfies part of the goal — NOT an intermediate implementation step. Keep sub-goals coarse-grained: if the goal says "rename X to Y and delete Y," the sub-goals are "rename X to Y" and "delete Y" — NOT "open the app," "navigate to X," "click rename," "type Y," "confirm rename" (those are individual steps within one sub-goal). For example, if the goal is "find what X ordered and order the same item," the sub-goals are "determine X's order" and "place the same order with correct quantity" — NOT "navigate to the orders page" or "open the catalog."
+
+
+For each sub-goal, identify its **end-state deliverable** — the concrete state change or output that proves the sub-goal is done (e.g., "text is pasted into the document," "file is saved to disk," "the correct item is ordered").
+
+**Step B: Completion Check** — For each sub-goal, determine: was it **actually** completed, not just attempted? Check that every value the agent produced exactly matches what the goal requires — even small differences count. When the goal specifies a value in quotes, treat the **entire** content within the quotes as the exact required value, including any punctuation that appears inside — a trailing period, comma, or other mark before the closing quote is part of the value, NOT sentence punctuation. For every write/type/rename action, explicitly compare the agent's typed value against the goal-required value and note any difference. An action that was started but never confirmed/finished does NOT count as completed. The agent claiming "done" does NOT prove completion — verify against the actual state. If a sub-goal was not completed, identify the specific step that most directly caused the failure.
+
+**Step C: Correct Approach Identification** — Determine what the **correct workflow** for this task would be. List the key steps an ideal agent would take. Then, for each actual transition, determine whether it is **on-path** (part of or consistent with the correct workflow) or **off-path** (the agent is pursuing a wrong strategy, exploring irrelevant areas, or detouring). This partition directly informs classification:
+- On-path transitions → candidates for `neutral`, `milestone`, `correct_decision`
+- Off-path transitions → candidates for `off_path`
+
+**Strategy-level off-path principle:** If the agent's **overall strategy** is wrong (e.g., text-searching when visual identification was needed, skipping a required resource/tab/page), then ALL steps executing that wrong strategy are off-path — including preparatory steps like clicking a search box or typing a query. The on/off-path classification comes from the strategy being served, not from the mechanical nature of the individual action. When the goal references multiple resources (tabs, files, pages), verify the agent uses them in the correct order — skipping a required resource and improvising is a wrong strategy.
+
+**Step D: Error Analysis** — For each failed sub-goal, trace the cause:
+1. Did the agent perform a **concretely wrong operation** (wrong click target, wrong typed value) whose result was **consumed by later steps**? If yes → that step is a `wrong_action`. This includes **abandoning a blocking operation** — if the agent clicked away from a pending confirmation dialog, terminal prompt (e.g., `[Y/n]`), or unsaved form, and that operation never completed as a result, the click-away IS the wrong action (the agent clicked the wrong target instead of the required confirmation).
+2. After that wrong action, did the agent successfully **undo/reverse** it? If yes → that corrective step is an `error_correction`.
+3. Did the environment produce a **clear, observable signal** that something was wrong (0 results, wrong name in dialog, wrong directory shown, error message), and the agent continued without addressing it? If yes → that step is a `missed_correction`.
+4. If no wrong operation was consumed downstream, but the agent **claimed completion** when the task was incomplete → that step is a `false_claim`. **But first check:** did you find ANY wrong_action in steps 1-3 above? If yes, the terminal step is `neutral` (not false_claim), because the failure is causally explained by the wrong_action, not by omission.
+
+**Step E: Achievement Analysis** — For each completed sub-goal:
+1. Which step made the sub-goal transition from not-done to done? → `milestone`. This MUST be the step that produces the **end-state deliverable** identified in Step A — not any preparatory step leading up to it.
+2. At any step, did the agent select correctly from ≥2 visually present alternatives, where the correct option required **non-textual reasoning** (icon recognition, indirect navigation, domain knowledge)? → `correct_decision`. **Important:** Steps already classified in Step D (wrong_action, error_correction, missed_correction, false_claim) keep their Step D classification — do not override them with correct_decision.
+
+**Step E-extra: Proactive correct_decision Scan** — This is critical and must not be skipped. For EVERY transition (not just completed sub-goals), explicitly ask:
+- Were there **≥2 plausible, clickable alternatives visible** on screen at that moment?
+- Did the agent pick the **correct** one?
+- Would a user who can **only read text** (no domain knowledge about the application) be UNABLE to make this selection? If yes → `correct_decision`.
+
+The core principle: `correct_decision` applies when the mapping from goal requirement to UI element requires **non-textual reasoning** — icon recognition, knowledge of application structure, or understanding of indirect navigation paths. If the UI element's label clearly indicates its relevance to the goal, selecting it is routine, not inference.
+
+**IS correct_decision:**
+- Clicking an **unlabeled icon** or an icon whose label doesn't match goal text (e.g., recognizing app icons in a taskbar by their visual appearance) — **first encounter only**
+- Navigating via an **indirect path** that requires domain knowledge (e.g., "Other Locations" to reach drives, system tray for audio controls)
+- Selecting a **system control or icon** whose function requires domain knowledge (e.g., recognizing that a funnel icon opens filter controls, recognizing a speaker icon for audio)
+- Choosing a menu/option whose **name doesn't directly appear in the goal** but requires knowing the application's navigation structure (e.g., clicking "All" menu to access application modules when the goal doesn't mention "All")
+- Recognizing that a **UI widget's current default state is wrong** and needs to be changed — when this requires understanding the widget's semantic behavior (e.g., changing a filter operator from "is" to "contains" requires understanding exact-match vs substring-match semantics), even if the target value appears in the goal text
+
+**NOT correct_decision (these are routine):**
+- Selecting an item whose **text label directly matches** the goal — e.g., goal says "find Books category" and a "Books" tab is visible; goal says "Colorblind safe" theme and "Colorblind safe" appears in a list; goal says "Speech Bubble" and "Speech Bubble" is in a dropdown
+- Clicking the only obvious button (e.g., a single "OK", "Next", or "Yes" button)
+- Routine typing, scrolling, or menu expansion
+- **Switching back to an app the agent has already used** — recognizing a previously-visited app icon is recall, not inference
+- Clicking a folder/file whose **name is visible and matches** what the agent is looking for — straightforward text matching
+- **Clicking a standard application menu/ribbon tab whose label directly names the function category** — e.g., clicking "View" tab when you need to change view settings, "Insert" tab when you need to insert something, "Format" for formatting. Standard ribbon tabs (File, Edit, View, Insert, Format, Tools, Home, etc.) are universal UI conventions, NOT domain knowledge. However, application-specific navigation elements whose labels do NOT directly describe the goal-related function (e.g., an "All" menu as navigation hub) can still be correct_decision if inferring its purpose requires domain knowledge
+- **Selecting search results whose snippet text clearly matches** the search query — text matching in search results is not inference
+- **Clicking universally recognized application icons** — browser icon, file manager, terminal, text editor, archive manager (e.g., WinRAR, 7-Zip), media player, or any application whose desktop shortcut has a **visible text label** beneath/beside the icon. These are universal computing knowledge, not domain-specific inference. If the shortcut text says "WinRAR" or "Firefox" or "LibreOffice Writer," it is text matching, not icon recognition
+- **Using a single obvious control inside a menu/panel that was just opened** — if opening a menu was correct_decision (finding it required domain knowledge), using the single obvious control within it is routine, not a second correct_decision. Do not double-count adjacent steps in the same navigation chain
+- **Clicking toolbar buttons whose text label is visible** — even if a toolbar button also has an icon, if its text label (e.g., "Info", "View", "Delete", "Commands", "Sound") is visible and directly describes its function, selecting it is text matching, not inference. This includes application-specific toolbar buttons whose names appear in the state summaries as descriptive text
+
+**Step F: Remaining Steps** — For steps not yet categorized:
+1. **State regression check:** Does this transition REVERSE progress toward a correct state (e.g., collapsing a menu that was showing needed items, navigating away from a correct page without completing the task there)? If yes → `off_path`. If the very next step restores the state that existed before → that next step is `meaningless`.
+2. Is the action an exact repeat with identical result already observed AND not causally necessary? → `meaningless`
+3. Is this step **off-path** (from Step C)? → `off_path`
+4. Otherwise → `neutral` (on-path, non-special UI interaction)
+
+---
+
+## Category Definitions (9 categories, mutually-exclusive)
+
+Each transition gets exactly ONE category label.
+
+### 1. `wrong_action`
+**Definition:** Performs a concretely wrong operation (wrong target, wrong value) whose result is consumed by ≥1 subsequent step OR is the final output.
+**Key test:** Was the wrong output used downstream, or is this the final step that produces an incorrect result?
+
+**IS wrong_action:**
+- Clicking/selecting a **concretely wrong UI element** when the correct one was available, and the agent then operates on that wrong selection (e.g., right-click wrong file → delete it; click wrong person → read their info)
+- Writing/typing a **wrong value** that remains in effect (wrong filename, wrong text, missing characters)
+- The **terminal step that outputs a specific wrong answer or commits a specific wrong result** — e.g., reporting "the birth year is 1972" when it's wrong, or clicking "Order Now" to commit a wrong item. This is wrong_action because the agent produced a concrete wrong value/result, not merely claimed "done"
+- **IMPORTANT: When the trajectory has an UNVERIFIED_CLAIM containing a specific answer/value, and the terminal action commits to that claim** (even via a placeholder action like `computer.terminate(status='success')` or any nonsensical action text), the terminal step IS `wrong_action` if the claimed value is wrong. The agent is producing a concrete wrong result through the claim, not merely saying "done."
+- **Abandoning an in-progress operation** — clicking away from a pending confirmation, dialog, or interactive prompt (e.g., a terminal `[Y/n]` prompt, a save dialog, an unsaved form) instead of completing it. If the abandoned operation never completes and its incompletion affects the final outcome, this is `wrong_action` — the agent performed a concretely wrong click (clicking elsewhere instead of the required confirmation target), and the result (operation never completed) is consumed downstream.
+
+**Causal origin rule:** In a **direct operational error sequence** — where the agent selects a wrong target and then immediately operates on that same target in consecutive steps (e.g., right-click wrong item → click "Delete" in context menu → confirm deletion) — the **first step that selects the wrong target** is the `wrong_action`, and subsequent steps that continue operating on that same wrong selection are `missed_correction` (because the UI shows the wrong target's name/details, giving the agent a clear signal). This rule applies ONLY to direct, consecutive operations on the same wrong target — NOT to strategy-level wrong approaches where the agent follows a wrong overall method (those steps are `off_path`, and any terminal step producing a wrong result from a wrong strategy is separately classified).
+
+**NOT wrong_action:**
+- A terminal "done" / "task complete" claim where the task is incomplete but no specific wrong value was produced AND no UNVERIFIED_CLAIM with a wrong value exists — that's `false_claim`
+- Navigation detours that are self-corrected (e.g., clicking the wrong folder then navigating back) — the wrong output was NOT consumed by subsequent steps, it was abandoned. These belong in `off_path`
+- **Exploratory navigation** to a new page/category/section where the agent is gathering information — if the agent hasn't committed to a wrong result but is simply exploring, this is `off_path` (off the correct workflow) or `neutral` (on-path), NOT wrong_action
+- Imprecise searches — these are exploration
+- Actions producing no observable state change
+
+### 2. `false_claim`
+**Definition:** Terminal step that claims completion but task is incomplete, AND no earlier wrong_action caused the failure (failure = omission), AND the terminal step does not itself produce a specific wrong value/answer, AND there is no UNVERIFIED_CLAIM with a specific wrong value.
+**Key test:** Is it the done-report AND is the failure from omission (not from a prior wrong_action)? Does it merely claim "done" without outputting a concrete wrong result?
+
+**Key principle — STRICT RULE:** false_claim applies ONLY when the failure is purely from omission — the agent never even attempted the missing sub-goal, or stopped too early. If ANY `wrong_action` exists in the trajectory that causally contributed to the failure, the termination step is NOT false_claim — it is just a consequence of the earlier error. Assign `neutral` to the termination step in that case. This rule applies even if the wrong_action only partially explains the failure.
+
+**IMPORTANT CLARIFICATION:** Only `wrong_action` blocks `false_claim`. The presence of `missed_correction` does NOT block `false_claim`. A `missed_correction` means the agent ignored a signal — that is a form of omission, which is exactly what `false_claim` captures. If the agent has `missed_correction` but zero `wrong_action`, and the terminal step claims completion on an incomplete task, it IS `false_claim`.
+
+**Distinction from wrong_action at terminal step:** If the terminal step outputs a **specific wrong answer or commits a specific wrong result** (e.g., reports wrong data, submits wrong form, or the UNVERIFIED_CLAIM contains a wrong value), that is `wrong_action`, not `false_claim`. `false_claim` is reserved for generic "I'm done" / "task complete" claims where the failure is omission-based and no wrong value was produced.
+
+**Recognizing false_claim actions:** Terminal actions that signal completion include not only explicit "task complete" messages but also **nonsensical or placeholder actions** like `computer.terminate(status='success')`, or any action text that is not a valid GUI operation and produces no observable state change. However, always check the UNVERIFIED_CLAIM first — if it contains a specific wrong answer, the terminal step is `wrong_action`, not `false_claim`.
+
+**Correct outcome via alternative method:** If the agent obtained the **factually correct result** (verified by checking the UI state and the UNVERIFIED_CLAIM value against what was visible on screen) but used an alternative method to reach it (e.g., keyword search instead of a field-specific filter), the terminal step is `neutral` — the task outcome is correct even if the methodology was non-ideal. Task completion is judged by whether the correct information/action was delivered, not by strict adherence to an exact methodology.
+
+### 3. `error_correction`
+**Definition:** Successfully reverses/undoes a prior wrong_action (Ctrl+Z, delete wrong file, re-enter correct value).
+**Key test:** Does it explicitly undo a specific prior error?
+
+### 4. `missed_correction`
+**Definition:** The environment produced a **clear, observable signal** that the current state doesn't match the goal requirements, but the agent continued without addressing it.
+
+**Observable signals (exhaustive list):**
+- A search/filter returned **0 results** (clear signal the query or approach is wrong)
+- A **confirmation dialog** displayed a wrong name/value (e.g., "Are you sure you want to delete 'Sheet1(3)'?" when the goal says Sheet3(1))
+- A **dialog or UI state** showed the wrong context (e.g., Save As dialog opened in the wrong directory, a form pre-filled with wrong values)
+- An **error message or warning** was displayed
+- The **result of an action visibly contradicts** the goal (e.g., wrong page loaded, wrong item details shown, wrong content appeared)
+- The agent initiates a **commitment action** (Save, Submit, Export, or any action that finalizes partial work) while the current document/form/UI state **visibly lacks a required modification** that should have been applied first — e.g., saving a document when the text is visibly not bold but the goal requires bolding, submitting a form with a required field visibly empty. The visible incomplete state IS the signal.
+
+**Key test:** Did the environment produce an objectively visible signal of a problem, and the agent proceeded without correcting it?
+
+**Selectivity principle:** Only mark the **most salient** signal — the step where the discrepancy first became clearly visible. Do NOT mark every subsequent step. If the signal appeared at step X and the agent continued for steps X+1, X+2, ..., only step X is `missed_correction`. For **commitment actions** (Save, Submit, etc.), the missed_correction is at the **first step that initiates the commitment** (e.g., pressing Ctrl+S), not at later steps in the save dialog sequence.
+
+### 5. `milestone`
+**Definition:** A sub-goal from Step A transitions from not-done to done at this step. Must be verifiable against goal decomposition.
+**Key test:** Can I point to which sub-goal was completed? Is this the step that produces the **end-state deliverable**, not a preparatory step?
+
+**Important clarification:** A milestone is the step where a **deliverable** is actually produced or a **state change** that satisfies a sub-goal takes effect. Reaching the right page, finding the right menu, or navigating to the right location is NOT a milestone — those are preparatory navigation steps (routine). Only the action that actually **completes** the sub-goal counts.
+
+
+**Verification test:** Ask: "Does this step produce the final output/state-change for a sub-goal from Step A?" If the step is just preparation enabling a later step to produce the deliverable, it is routine, not milestone.
+
+Examples:
+- Pasting copied text into a document = milestone (content delivered)
+- Copying text (Ctrl+C) = routine (preparation for paste — the deliverable is the paste, not the copy)
+- Finding the Books category page = routine (navigation, not deliverable)
+- Clicking Save and the file is saved = milestone (state change that satisfies sub-goal)
+- Typing a filename in a save dialog = routine (preparation for save)
+- Creating a folder = routine if the sub-goal is "save file to folder" (folder creation is preparation)
+- Navigating to the Requested Items page = routine (the deliverable would be finding the specific item info)
+- Applying a filter that returns results = routine (finding items is preparation for the actual goal action)
+- Opening a dropdown/menu that reveals the needed option = routine (preparation)
+- Selecting the correct view mode (e.g., Report view) = routine if the sub-goal is "change the theme" (switching views is preparation)
+- Navigating to the correct directory in a file dialog = routine (the deliverable is the actual save/open)
+- Opening an application (e.g., WinRAR, Settings, browser) = routine (opening is preparation for using it)
+- Selecting a file/folder to operate on = routine (selection is preparation for the actual operation)
+- Closing a dialog/viewer after viewing content = routine (cleanup, not a deliverable)
+
+### 6. `correct_decision`
+**Definition:** Agent selects correctly from ≥2 visually present alternatives, where the correct option required **non-textual reasoning** — icon recognition, indirect navigation knowledge, or domain expertise. A user who can only read visible text without domain knowledge would NOT be able to make this selection.
+**Key test:** Are there ≥2 plausible options visible AND the agent picked right AND a text-only user couldn't make this choice?
+
+### 7. `off_path`
+**Definition:** A transition that is NOT part of the correct workflow for the task. The agent is pursuing a wrong strategy, exploring irrelevant areas, navigating to wrong locations, or detouring from the optimal path.
+**Key test:** Would an ideal agent who knows the correct approach have taken this step? If no → `off_path`.
+
+**IS off_path:**
+- Agent navigated to a **wrong directory/section/page** (e.g., clicked "Videos" instead of "Other Locations" to find a drive)
+- Agent started a **wrong strategy** (e.g., text-based search when visual identification was needed)
+- **All steps executing a wrong strategy are off_path** — including preparatory actions (clicking search boxes, typing queries) that serve the wrong strategy. A preparatory action that initiates or continues a wrong strategy is off_path, not neutral
+- Agent is **browsing/exploring** after a failed attempt (e.g., after filter returns 0 results, agent manually browses categories — ALL steps in this alternative exploration are off_path)
+- Agent **clicked on an incorrect option** that didn't produce a consumed wrong result (navigation detour that was abandoned)
+- Agent took an **unnecessary detour** before finding the correct path
+
+**Within-sequence off_path:** Even within an on-path sub-goal sequence (e.g., navigating a save dialog), individual transitions can be off_path if they represent unnecessary clicks, wrong directory navigation, or detours that do not contribute to reaching the correct target. Evaluate each transition independently.
+
+**NOT off_path:**
+- Steps on the **correct approach** to the task, even if visiting a page for the first time — first-time navigation along the correct path is `neutral`
+- Steps that produced an error consumed downstream — those are `wrong_action`
+- Exact repeat actions — those are `meaningless`
+
+### 8. `meaningless`
+**Definition:** Zero information gain (identical action+result already observed) AND not causally necessary for any future step.
+**Key test:** Was this exact action+result already seen before?
+
+**Detection procedure:** For each transition, check: (1) Has a **semantically equivalent action** been performed before in this trajectory? (2) Did the result produce **no observable state change** or the **same state** as the prior occurrence? If both yes → `meaningless`. Pay special attention to the state summary: phrases like "no changes are observable," "remains identical," or "the page looks the same" are strong indicators. An action that fails to produce its intended effect (e.g., clicking an option but the setting doesn't change) AND was already attempted with the same failure is `meaningless`.
+
+**Qualifies:**
+- Repeating an action whose identical result was already observed (second or later repeat when the first attempt already showed the result)
+- Undoing then redoing: if a UI element was already expanded/visible, the agent collapses then re-expands it — the **collapse is off_path** (counterproductive navigation away from the correct state) and the **re-expansion is meaningless** (restoring a state that already existed before the unnecessary collapse)
+- Clicking the same UI element multiple times when the state summary confirms **no change** after the first click
+
+**Does NOT qualify:**
+- Any first-time encounter, even if the outcome seems predictable
+- Any action causally necessary for a future step
+- The done-report / termination step
+
+### 9. `neutral`
+**Definition:** Default — on-path UI interaction that doesn't qualify for any other category. Typing known values, clicking required buttons, scrolling to reach needed content, navigation along the correct workflow path. Priority is lowest: only assign if no other category applies.
+**Key test:** Is this step on the correct workflow path AND does it not fit any other category?
+
+---
+
+## Forbidden Contradictory Pairs
+
+A single transition CANNOT have both:
+- `meaningless` + `off_path` (zero info vs off-path exploration)
+- `wrong_action` + `error_correction` (wrong vs correcting)
+- `meaningless` + `milestone` (zero info vs completing a sub-goal)
+- `neutral` + `meaningless` (useful routine vs zero info gain)
+- `neutral` + `off_path` (on-path vs off-path)
+
+Each transition gets exactly ONE category. If uncertain, choose the category whose definition most precisely matches the transition's observable behavior and causal role.
+
+---
+
+## Pre-Output Consistency Check
+
+Before writing your final answer, verify these common pitfalls:
+1. **false_claim check:** If the terminal step claims completion on an incomplete task, check: are there ANY `wrong_action` labels in your classification? If NO → the terminal step MUST be `false_claim` (not neutral). `missed_correction` does NOT block `false_claim`.
+2. **meaningless check:** For any transition where the state summary says "no changes" or "remains identical," check if the same action was attempted before. If yes → `meaningless`.
+3. **correct_decision check:** For each `correct_decision`, verify the UI element had NO visible text label matching the goal. Desktop shortcuts with visible names are NEVER correct_decision.
+
+## Output Instructions
+
+First provide your reasoning following Steps A through F. Then output your final classification.
+
+You MUST output exactly one line per transition, covering ALL transitions from Transition 1 to the last transition in the trajectory. Every transition must have exactly one category label. You must use <answer_step> and </answer_step>.
+
+Note: Transition N corresponds to the state change from img(N-1) to imgN (e.g., Transition 1 is img0 -> img1, Transition 2 is img1 -> img2, and so on).
+
+Output your answer in the following format:
+
+My reasoning analysis is: ....
+
+<answer_step>
+Transition 1: <category_name>
+Transition 2: <category_name>
+...
+</answer_step>
+
+Valid category names (use EXACTLY these strings):
+wrong_action, false_claim, error_correction, missed_correction, milestone, correct_decision, off_path, meaningless, neutral

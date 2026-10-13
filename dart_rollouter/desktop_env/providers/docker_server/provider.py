@@ -19,6 +19,7 @@ logger.setLevel(logging.INFO)
 WAIT_TIME = 3
 RETRY_INTERVAL = 1
 LOCK_TIMEOUT = 10
+START_EMULATOR_TIMEOUT = 180
 
 
 class PortAllocationError(Exception):
@@ -193,9 +194,9 @@ class RemoteDockerProvider(Provider):
                 url = f"http://{server_ip}:{server_port}/start_emulator"
                 if token:
                     headers = {"Authorization": f"Bearer {token}"}
-                    resp = requests.post(url, json={"token": str(token)}, headers=headers, timeout=30)
+                    resp = requests.post(url, json={"token": str(token)}, headers=headers, timeout=START_EMULATOR_TIMEOUT)
                 else:
-                    resp = requests.get(url, timeout=30)
+                    resp = requests.get(url, timeout=START_EMULATOR_TIMEOUT)
                 
                 data = resp.json()
                 

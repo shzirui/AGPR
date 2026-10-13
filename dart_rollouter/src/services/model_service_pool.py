@@ -1,3 +1,5 @@
+import random
+
 import ray
 import aiohttp
 import asyncio
@@ -84,6 +86,7 @@ class ModelServicePool:
         print(f"Model Service Endpoint:>>> {self.service_url}")
 
         self.ckpt_path = model_cfg.ckpt_path
+        self.served_model = str(getattr(model_cfg, "served_model", "Qwen3.6-27B"))
 
         # self.tokenizer = hf_tokenizer(self.ckpt_path, trust_remote_code=True)
         # self.processor = hf_processor(self.ckpt_path, trust_remote_code=True, use_fast=True)
@@ -106,7 +109,7 @@ class ModelServicePool:
                 if not response.ok:
                     error_text = await response.text()
                     raise Exception(f"API call failed with status {response.status}: {error_text}")
-                
+
                 response_data = await response.json()
                 try:
                     content = response_data["choices"][0]["message"]["content"]
@@ -125,45 +128,62 @@ class ModelServicePool:
                             token_id_list = [int(item["token"].split("token_id:")[1]) for item in response_data["choices"][0]["logprobs"]["content"]]
                         except (KeyError, IndexError):
                             token_id_list = None
-                        
+
                     return content, model, logp_list, token_id_list
-                        
+
                 except (KeyError, IndexError, TypeError) as e:
                     raise Exception(f"Failed to parse response: {e}. Full response: {response_data}")
-                
+
     async def generate_vllm(self, messages: List[Dict[str, str]],  **kwargs) -> str:
         """
         Send a chat request to the vLLM OpenAI-compatible server.
         """
-        # 1. 扁平化 Payload，并强制加入 model 名称（必须与启动脚本的 --served-model-name 一致）
+        return_message = bool(kwargs.pop("return_message", False))
         payload = {
-            "model": "qwen3vl-8b",  # 【关键修改】必须带上模型名字
+            "model": self.served_model,
             "messages": messages,
         }
-        # 将 kwargs 里的参数平铺放入 payload
+
         payload.update(kwargs)
 
         print(f"begin to generate at {datetime.now()}")
-        
-        # 2. 【关键修改】修正 Endpoint 路径为标准的 OpenAI 格式
-        generate_endpoint = self.service_url + "/v1/chat/completions"
-        print(f"generate_endpoint:>>> {generate_endpoint}")
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(generate_endpoint, json=payload) as response:
-                if not response.ok:
-                    error_text = await response.text()
-                    raise Exception(f"API call failed with status {response.status}: {error_text}")
-                
-                response_data = await response.json()
-                try:
-                    content = response_data["choices"][0]["message"]["content"]
-                    model = response_data["model"]
-                        
-                    return content, model
-                        
-                except (KeyError, IndexError, TypeError) as e:
-                    raise Exception(f"Failed to parse response: {e}. Full response: {response_data}")
+        if isinstance(self.service_url, str):
+            self.service_urls = [self.service_url]
+        else:
+            self.service_urls = list(self.service_url)
+
+        shuffled_urls = random.sample(self.service_urls, len(self.service_urls))
+
+        for base_url in shuffled_urls:
+            base_url = base_url.strip()
+            generate_endpoint = base_url + "/v1/chat/completions"
+            print(f"generate_endpoint:>>> {generate_endpoint}")
+
+            try:
+
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(generate_endpoint, json=payload) as response:
+                        if not response.ok:
+                            error_text = await response.text()
+                            raise Exception(f"API call failed with status {response.status}: {error_text}")
+
+                        response_data = await response.json()
+                        try:
+                            message = response_data["choices"][0]["message"]
+                            content = message.get("content") or ""
+                            model = response_data["model"]
+
+                            return (message if return_message else content), model
+
+                        except (KeyError, IndexError, TypeError) as e:
+                            raise Exception(f"Failed to parse response: {e}. Full response: {response_data}")
+            except Exception as e:
+                print(f"⚠️ Node {base_url} failed with error: {e}. Switching to the next node...")
+                last_error = e
+                continue
+
+        raise Exception(f"❌ All model service nodes are unavailable! Last error: {last_error}")
 
     async def tokenize(self, messages: str, **kwargs) -> List[int]:
         """
@@ -265,7 +285,7 @@ class ModelServicePool:
             str: Path of the previous model version, or empty string if not exists
         """
         checkpoint_info = await self.get_checkpoint_info()
-        return checkpoint_info.get("last_model_version") or checkpoint_info.get("last_ckpt_path", "")
+        return checkpoint_info.get("last_ckpt_path", "")
 
     def process_images_sync(self, images):
         """

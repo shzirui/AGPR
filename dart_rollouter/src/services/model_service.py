@@ -19,11 +19,9 @@ import torch
 
 from fastapi import HTTPException, status
 from pydantic import BaseModel, Field
-from safetensors import safe_open
 
 import socket
 from datetime import datetime
-import re
 
 # Global flag: Whether NVML is available
 NVML_AVAILABLE = False
@@ -87,13 +85,6 @@ class ModelConfig(BaseModel):
     vllm_params: Dict[str, Any] = Field(default_factory=dict, description="Additional vLLM startup parameters")
     save_local: bool = Field(False, description="Whether to save locally")
     save_path: str = Field(default="./", description="Save path")
-    enable_lora: bool = Field(False, description="Whether to start vLLM with a LoRA adapter")
-    lora_adapter_path: Optional[str] = Field(None, description="LoRA adapter path for initial startup")
-    max_lora_rank: int = Field(32, description="Maximum LoRA rank for vLLM")
-    use_vllm_v0_compat: bool = Field(False, description="Force the vLLM V0 backend and disable torch compile")
-    enable_qwen3_vllm_options: bool = Field(False, description="Add Qwen3 reasoning and context-length options")
-    max_model_len: Optional[int] = Field(None, description="Optional vLLM maximum model length")
-    reasoning_parser: Optional[str] = Field(None, description="Optional vLLM reasoning parser")
     
 class Message(BaseModel):
     role: str
@@ -112,12 +103,10 @@ class SaveRequest(BaseModel):
     reward: float
     task_id: str
     trace_id: str
-    parsed_actions: Optional[List[Dict[str, Any]]] = None
     
 class ReloadRequest(BaseModel):
     new_ckpt_path: str = Field(..., description="New model checkpoint path")
     batch_size: int = Field(1, description="Rolling update batch size", gt=0)
-    lora_adapter_path: Optional[str] = Field(None, description="LoRA adapter path to serve with the base checkpoint")
 
 
 # -------------------------------------------------------------------------
@@ -128,46 +117,24 @@ class ServiceInstance:
     """
     Use a data class to uniformly manage the state of each service instance.
     """
-    def __init__(
-        self,
-        port: int,
-        gpu_id: int,
-        process: subprocess.Popen,
-        ckpt_path: str,
-        lora_adapter_path: Optional[str] = None,
-        served_model_name: Optional[str] = None,
-    ):
+    def __init__(self, port: int, gpu_id: int, process: subprocess.Popen, ckpt_path: str):
         self.port = port
         self.gpu_id = gpu_id
         self.process = process
         self.endpoint = f"http://localhost:{port}"
         self.requests_in_flight = 0
         self.ckpt_path = ckpt_path
-        self.lora_adapter_path = lora_adapter_path
-        self.served_model_name = served_model_name or ckpt_path
-        self.model_version = lora_adapter_path or ckpt_path
 
     def __repr__(self):
-        return (
-            f"<ServiceInstance(port={self.port}, gpu_id={self.gpu_id}, pid={self.process.pid}, "
-            f"model_version={self.model_version})>"
-        )
+        return f"<ServiceInstance(port={self.port}, gpu_id={self.gpu_id}, pid={self.process.pid})>"
 
 
 class GPUInstance:
     """
     Use a data class to uniformly manage the state of each GPU instance, including GPU-level NVML management
     """
-    def __init__(
-        self,
-        gpu_id: int,
-        gpu_memory_utilization: float = 0.9,
-        nvml_gpu_id: Optional[int] = None,
-        cuda_visible_device: Optional[str] = None,
-    ):
+    def __init__(self, gpu_id: int, gpu_memory_utilization: float = 0.9):
         self.gpu_id = gpu_id
-        self.nvml_gpu_id = gpu_id if nvml_gpu_id is None else nvml_gpu_id
-        self.cuda_visible_device = str(self.nvml_gpu_id if cuda_visible_device is None else cuda_visible_device)
         self.gpu_memory_utilization = gpu_memory_utilization
         self.is_available = False
         self._handle = None
@@ -185,9 +152,9 @@ class GPUInstance:
             return
             
         try:
-            self._handle = pynvml.nvmlDeviceGetHandleByIndex(self.nvml_gpu_id)
+            self._handle = pynvml.nvmlDeviceGetHandleByIndex(self.gpu_id)
         except pynvml.NVMLError as e:
-            logger.error(f"Failed to initialize GPU {self.gpu_id} (NVML index {self.nvml_gpu_id}): {e}")
+            logger.error(f"Failed to initialize GPU {self.gpu_id}: {e}")
             self._handle = None
 
     def check_and_set_availability(self, gpu_memory_utilization: float = None) -> bool:
@@ -207,15 +174,9 @@ class GPUInstance:
             free_memory = memory_info.free
             required_memory = int(total_memory * gpu_memory_utilization)
             self.is_available = free_memory >= required_memory
-            logger.info(
-                f"GPU {self.gpu_id} (NVML index {self.nvml_gpu_id}) memory check: "
-                f"free={free_memory // 1024 // 1024}MiB, "
-                f"required={required_memory // 1024 // 1024}MiB, "
-                f"available={self.is_available}"
-            )
             return self.is_available
         except pynvml.NVMLError as e:
-            logger.error(f"Error checking GPU {self.gpu_id} (NVML index {self.nvml_gpu_id}) availability: {e}")
+            logger.error(f"Error checking GPU {self.gpu_id} availability: {e}")
             self.is_available = False
             return False
 
@@ -227,10 +188,7 @@ class GPUInstance:
             pass
 
     def __repr__(self):
-        return (
-            f"<GPUInstance(gpu_id={self.gpu_id}, nvml_gpu_id={self.nvml_gpu_id}, "
-            f"cuda_visible_device={self.cuda_visible_device}, is_available={self.is_available})>"
-        )
+        return f"<GPUInstance(gpu_id={self.gpu_id}, is_available={self.is_available})>"
     
     def get_memory_info(self) -> dict:
         """Get current GPU memory information for debugging"""
@@ -256,9 +214,7 @@ class ModelServicePool:
         logger.info("Initializing ModelServicePool...")
         self.model_cfg = model_cfg
         self.default_ckpt_path = model_cfg.ckpt_path
-        self.default_lora_adapter_path = model_cfg.lora_adapter_path if model_cfg.enable_lora else None
         self.last_ckpt_path = model_cfg.ckpt_path
-        self.last_lora_adapter_path = self.default_lora_adapter_path
         self.base_port = model_cfg.base_port
         self.replicas = model_cfg.replicas
         self.vllm_params = model_cfg.vllm_params
@@ -270,7 +226,6 @@ class ModelServicePool:
         self.instances_lock = asyncio.Lock()  # Protect service_instances dictionary
         self.gpu_lock = asyncio.Lock()        # Protect GPU_Instances dictionary
         self.config_lock = asyncio.Lock()     # Protect configuration changes
-        self.recovery_lock = asyncio.Lock()   # Avoid concurrent replica recovery storms
         
         # {gpu_id: ServiceInstance}
         self.service_instances: Dict[int, ServiceInstance] = {}
@@ -278,127 +233,6 @@ class ModelServicePool:
         self.gpu_instances: Dict[int, GPUInstance] = {}
         
         self.monitoring_task: Optional[asyncio.Task] = None
-        self.recovery_enabled = False
-        self.shutting_down = False
-
-    def _validate_model_path(self, ckpt_path: str):
-        """Fail fast for local checkpoint paths that vLLM cannot load."""
-        if not ckpt_path:
-            raise ValueError("Checkpoint path is empty.")
-
-        # Non-absolute values may be Hugging Face repo IDs, so leave them to vLLM.
-        if not os.path.isabs(ckpt_path):
-            return
-
-        if not os.path.isdir(ckpt_path):
-            raise ValueError(f"Checkpoint path does not exist in this container: {ckpt_path}")
-
-        if not self._has_model_config(ckpt_path):
-            raise ValueError(
-                f"Checkpoint path is missing config.json or params.json: {ckpt_path}"
-            )
-
-    def _validate_lora_adapter_path(self, lora_adapter_path: str):
-        if not lora_adapter_path:
-            raise ValueError("LoRA adapter path is empty.")
-        if not os.path.isabs(lora_adapter_path):
-            return
-        if not os.path.isdir(lora_adapter_path):
-            raise ValueError(f"LoRA adapter path does not exist in this container: {lora_adapter_path}")
-        if not os.path.isfile(os.path.join(lora_adapter_path, "adapter_config.json")):
-            raise ValueError(f"LoRA adapter path is missing adapter_config.json: {lora_adapter_path}")
-        adapter_model_path = os.path.join(lora_adapter_path, "adapter_model.safetensors")
-        if not os.path.isfile(adapter_model_path):
-            raise ValueError(f"LoRA adapter path is missing adapter_model.safetensors: {lora_adapter_path}")
-        try:
-            with safe_open(adapter_model_path, framework="pt", device="cpu") as f:
-                num_keys = len(f.keys())
-        except Exception as exc:
-            raise ValueError(f"LoRA adapter_model.safetensors cannot be opened: {adapter_model_path}: {exc}") from exc
-        if num_keys <= 0:
-            raise ValueError(f"LoRA adapter_model.safetensors has no tensor keys: {adapter_model_path}")
-
-    def _has_model_config(self, ckpt_path: str) -> bool:
-        """Return whether a local path looks loadable by vLLM."""
-        has_config = any(
-            os.path.isfile(os.path.join(ckpt_path, filename))
-            for filename in ("config.json", "params.json")
-        )
-        return has_config
-
-    def _checkpoint_sort_key(self, ckpt_path: str):
-        """Sort checkpoint candidates by global_step number first, then mtime."""
-        match = re.search(r"global_step_(\d+)", ckpt_path)
-        step = int(match.group(1)) if match else -1
-        try:
-            mtime = os.path.getmtime(ckpt_path)
-        except OSError:
-            mtime = 0
-        return step, mtime
-
-    def _checkpoint_search_root(self, ckpt_path: str) -> str:
-        """
-        Return the directory that contains global_step_* checkpoint folders.
-        If ckpt_path is already inside global_step_N/actor/huggingface, this
-        returns the parent directory that contains global_step_N.
-        """
-        parts = os.path.normpath(ckpt_path).split(os.sep)
-        for idx, part in enumerate(parts):
-            if re.fullmatch(r"global_step_\d+", part):
-                root_parts = parts[:idx]
-                if not root_parts:
-                    return os.sep
-                return os.sep.join(root_parts) or os.sep
-        return ckpt_path
-
-    def _resolve_checkpoint_path(self, ckpt_path: str) -> str:
-        """
-        Resolve a checkpoint input to a concrete vLLM-loadable directory.
-        If a parent directory is provided, pick the newest global_step*/actor/huggingface.
-        """
-        if not ckpt_path:
-            raise ValueError("Checkpoint path is empty.")
-
-        if not os.path.isabs(ckpt_path):
-            return ckpt_path
-
-        if not os.path.isdir(ckpt_path):
-            raise ValueError(f"Checkpoint path does not exist in this container: {ckpt_path}")
-
-        candidates = []
-        search_root = self._checkpoint_search_root(ckpt_path)
-        direct_candidates = [
-            ckpt_path,
-            os.path.join(ckpt_path, "huggingface"),
-            os.path.join(ckpt_path, "actor", "huggingface"),
-        ]
-        for candidate in direct_candidates:
-            if os.path.isdir(candidate) and self._has_model_config(candidate):
-                candidates.append(candidate)
-
-        for root, dirs, _ in os.walk(search_root):
-            if "huggingface" in dirs:
-                candidate = os.path.join(root, "huggingface")
-                if self._has_model_config(candidate):
-                    candidates.append(candidate)
-
-        if not candidates:
-            raise ValueError(
-                f"No loadable checkpoint found under {ckpt_path}; "
-                "expected config.json or params.json in a checkpoint directory."
-            )
-
-        resolved = max(set(candidates), key=self._checkpoint_sort_key)
-        if resolved != ckpt_path:
-            logger.warning(
-                f"Resolved checkpoint input {ckpt_path} to latest loadable checkpoint {resolved} "
-                f"by scanning {search_root}"
-            )
-        else:
-            logger.info(
-                f"Checkpoint input {ckpt_path} is the latest loadable checkpoint under {search_root}"
-            )
-        return resolved
 
     async def initialize(self):    
         """
@@ -406,11 +240,6 @@ class ModelServicePool:
         Used for initial startup
         """
         try:
-            self.shutting_down = False
-            self.recovery_enabled = False
-            self._validate_model_path(self.default_ckpt_path)
-            if self.default_lora_adapter_path:
-                self._validate_lora_adapter_path(self.default_lora_adapter_path)
             gpu_count = self._get_gpu_count()
             if gpu_count == 0:
                 raise RuntimeError("No available GPUs found. Cannot start ModelServicePool.")
@@ -436,7 +265,6 @@ class ModelServicePool:
                         self.service_instances[instance.gpu_id] = instance
 
             # Start background monitoring task
-            self.recovery_enabled = True
             self.monitoring_task = asyncio.create_task(self._monitor_replicas())
             
             logger.info("ModelServicePool initialized and monitoring started.")
@@ -450,8 +278,6 @@ class ModelServicePool:
     async def shutdown(self):
         """Safely shutdown the entire model service pool."""
         logger.info("Final shutdown sequence initiated.")
-        self.shutting_down = True
-        self.recovery_enabled = False
         if self.monitoring_task and not self.monitoring_task.done():
             self.monitoring_task.cancel()
         await self._shutdown_all_services()
@@ -459,15 +285,9 @@ class ModelServicePool:
 
     async def _init_gpu_instances(self) -> List[GPUInstance]:
         """Initialize all GPU instances"""
-        visible_devices = self._get_visible_gpu_devices()
-        for logical_gpu_id, cuda_visible_device in enumerate(visible_devices):
-            nvml_gpu_id = self._cuda_visible_device_to_nvml_index(cuda_visible_device)
-            self.gpu_instances[logical_gpu_id] = GPUInstance(
-                logical_gpu_id,
-                self.gpu_memory_utilization,
-                nvml_gpu_id=nvml_gpu_id,
-                cuda_visible_device=cuda_visible_device,
-            )
+        gpu_count = self._get_gpu_count()
+        for gpu_id in range(gpu_count):
+            self.gpu_instances[gpu_id] = GPUInstance(gpu_id, self.gpu_memory_utilization)
 
     async def _start_initial_services(self) -> List[ServiceInstance]:
         """Start the initial [replicas] number of service instances."""
@@ -481,19 +301,8 @@ class ModelServicePool:
             ]
         
         if not available_gpus:
-            logger.warning("No available GPUs to start initial services. Trying stale model cleanup once.")
-            cleaned = await self._cleanup_stale_model_processes()
-            if cleaned:
-                await asyncio.sleep(5)
-                async with self.gpu_lock:
-                    available_gpus = [
-                        instance.gpu_id for instance in self.gpu_instances.values()
-                        if instance.check_and_set_availability()
-                    ]
-
-            if not available_gpus:
-                logger.warning("No available GPUs to start initial services.")
-                return []
+            logger.warning("No available GPUs to start initial services.")
+            return []
 
         gpus_to_use = available_gpus[:min(self.replicas, len(available_gpus))]
         
@@ -508,7 +317,7 @@ class ModelServicePool:
         
         # Start service instances (without holding lock)
         tasks = [
-            self._add_new_service_instance(port, gpu_id, self.default_ckpt_path, self.default_lora_adapter_path) 
+            self._add_new_service_instance(port, gpu_id, self.default_ckpt_path) 
             for port, gpu_id in zip(ports_to_use, gpus_to_use)
         ]
         instances = await asyncio.gather(*tasks)
@@ -522,31 +331,22 @@ class ModelServicePool:
             return None
         
         port_to_use = ports[0]
-        instance = await self._add_new_service_instance(port_to_use, gpu_id, self.default_ckpt_path, self.default_lora_adapter_path)
+        instance = await self._add_new_service_instance(port_to_use, gpu_id, self.default_ckpt_path)
 
         if not await self.wait_for_model_pool_ready([instance]):
             return None
         return instance
 
-    async def _add_new_service_instance(
-        self,
-        port: int,
-        gpu_id: int,
-        ckpt_path: str,
-        lora_adapter_path: Optional[str] = None,
-    ) -> ServiceInstance:
+    async def _add_new_service_instance(self, port: int, gpu_id: int, ckpt_path: str) -> ServiceInstance:
         """Start a new service instance and add it to the pool."""
-        logger.info(
-            f"Attempting to start service on port {port} with GPU {gpu_id} from ckpt_path {ckpt_path}"
-            f" lora_adapter_path={lora_adapter_path}..."
-        )
+        logger.info(f"Attempting to start service on port {port} with GPU {gpu_id} from ckpt_path {ckpt_path}...")
         
         # Mark GPU as unavailable
         async with self.gpu_lock:
             if gpu_id in self.gpu_instances:
                 self.gpu_instances[gpu_id].is_available = False
         
-        proc = self._launch_vllm_process(port, gpu_id, ckpt_path, lora_adapter_path=lora_adapter_path)
+        proc = self._launch_vllm_process(port, gpu_id, ckpt_path)
         if not proc:
             logger.error(f"Failed to launch process on port {port}.")
             # Restore GPU availability
@@ -555,59 +355,24 @@ class ModelServicePool:
                     self.gpu_instances[gpu_id].is_available = True
             raise RuntimeError(f"Failed to launch vLLM process on GPU {gpu_id}")
         
-        instance = ServiceInstance(
-            port,
-            gpu_id,
-            proc,
-            ckpt_path,
-            lora_adapter_path=lora_adapter_path,
-            served_model_name="default" if lora_adapter_path else ckpt_path,
-        )
+        instance = ServiceInstance(port, gpu_id, proc, ckpt_path)
         logger.info(f"Successfully started service instance: {instance}")
         
         # Start log monitoring
-        asyncio.create_task(self._stream_process_output(instance))
+        asyncio.create_task(self._stream_process_output(proc, port))
 
         return instance
 
-    def _launch_vllm_process(
-        self,
-        port: int,
-        gpu_id: int,
-        ckpt_path: str,
-        lora_adapter_path: Optional[str] = None,
-    ) -> Optional[subprocess.Popen]:
+    def _launch_vllm_process(self, port: int, gpu_id: int, ckpt_path: str) -> Optional[subprocess.Popen]:
         """Launch vLLM subprocess."""
         env = os.environ.copy()
-        gpu_instance = self.gpu_instances.get(gpu_id)
-        env["CUDA_VISIBLE_DEVICES"] = (
-            gpu_instance.cuda_visible_device if gpu_instance else str(gpu_id)
-        )
-
-        if self.model_cfg.use_vllm_v0_compat:
-            env["VLLM_USE_V1"] = "0"
-            env["VLLM_V1"] = "0"
-            env["VLLM_TORCH_COMPILE_LEVEL"] = "0"
-            env["TORCH_COMPILE_DISABLE"] = "1"
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         
         vllm_command = [
             "vllm", "serve", ckpt_path,
             "--trust-remote-code",
             "--port", str(port)
         ]
-        if lora_adapter_path:
-            self._validate_lora_adapter_path(lora_adapter_path)
-            vllm_command.extend([
-                "--enable-lora",
-                "--max-lora-rank", str(self.model_cfg.max_lora_rank),
-                "--lora-modules", f"default={lora_adapter_path}",
-            ])
-
-        if self.model_cfg.enable_qwen3_vllm_options:
-            if self.model_cfg.max_model_len is not None:
-                vllm_command.extend(["--max-model-len", str(self.model_cfg.max_model_len)])
-            if self.model_cfg.reasoning_parser is not None:
-                vllm_command.extend(["--reasoning-parser", self.model_cfg.reasoning_parser])
 
         # Dynamically add parameters from vllm_params
         for key, value in self.vllm_params.items():
@@ -629,39 +394,20 @@ class ModelServicePool:
                 stderr=subprocess.PIPE,
                 env=env, 
                 bufsize=1, 
-                universal_newlines=True,
-                start_new_session=True,
+                universal_newlines=True
             )
         except (OSError, FileNotFoundError) as e:
             logger.error(f"Error launching vLLM process on port {port}: {e}")
             return None
 
-    async def _remove_service_instance(
-        self,
-        gpu_id: int,
-        kill: bool = False,
-        expected_instance: Optional[ServiceInstance] = None,
-    ):
+    async def _remove_service_instance(self, gpu_id: int, kill: bool = False):
         """Stop and clean up the specified vllm serve instance, and release GPU resources."""
         instance = None
         async with self.instances_lock:
-            current = self.service_instances.get(gpu_id)
-            if expected_instance is not None and current is None:
-                instance = None
-            elif expected_instance is not None and current is not expected_instance:
-                logger.info(
-                    f"Skip removing GPU {gpu_id}: instance changed or was already removed."
-                )
-                return
-            else:
-                instance = self.service_instances.pop(gpu_id, None)
+            instance = self.service_instances.pop(gpu_id, None)
 
         if not instance:
             logger.warning(f"No service instance found on GPU {gpu_id} to remove.")
-            if expected_instance is not None:
-                async with self.gpu_lock:
-                    if gpu_id in self.gpu_instances:
-                        self.gpu_instances[gpu_id].is_available = True
             return
 
         logger.info(f"Shutting down service on GPU {gpu_id}, port {instance.port} (PID: {instance.process.pid if instance.process else 'N/A'})...")
@@ -766,7 +512,7 @@ class ModelServicePool:
         
         # Start service instances (without holding lock)
         tasks = [
-            self._add_new_service_instance(port, gpu_id, self.default_ckpt_path, self.default_lora_adapter_path) 
+            self._add_new_service_instance(port, gpu_id, self.default_ckpt_path) 
             for port, gpu_id in zip(ports_to_use, gpus_to_use)
         ]
         instances = await asyncio.gather(*tasks)
@@ -788,23 +534,12 @@ class ModelServicePool:
         while True:
             try:
                 await self._check_all_service_health()
-                await self._recover_replicas_now("periodic monitor")
+                await self._ensure_replicas()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in monitoring task: {e}")
             await asyncio.sleep(30)
-
-    async def _recover_replicas_now(self, reason: str):
-        """Recover missing replicas immediately, serialized to avoid duplicate startups."""
-        if self.shutting_down or not self.recovery_enabled:
-            return
-
-        async with self.recovery_lock:
-            if self.shutting_down or not self.recovery_enabled:
-                return
-            logger.info(f"Replica recovery triggered by: {reason}")
-            await self._ensure_replicas()
 
     async def _ensure_replicas(self):
         """Core recovery logic: Check current service status, start missing replicas."""
@@ -830,39 +565,11 @@ class ModelServicePool:
         ports_to_create = await self._find_available_ports(min(len(available_gpus), needed))
         
         if not available_gpus:
-            if num_active == 0:
-                cleaned = await self._cleanup_stale_model_processes()
-                if cleaned:
-                    await asyncio.sleep(5)
-                    async with self.gpu_lock:
-                        available_gpus = [
-                            instance.gpu_id for instance in self.gpu_instances.values()
-                            if instance.check_and_set_availability()
-                        ]
-                    ports_to_create = await self._find_available_ports(min(len(available_gpus), needed))
-
-                    if available_gpus:
-                        logger.info(
-                            f"Recovered GPU availability after cleaning stale model processes: {available_gpus}"
-                        )
-                    else:
-                        logger.warning(
-                            "Stale model cleanup ran, but GPUs are still not available."
-                        )
-
-            if available_gpus:
-                num_to_start = min(len(ports_to_create), len(available_gpus), needed)
-            else:
-                logger.warning("Warning: Cannot restore replicas, no free GPUs available.")
-                return
-
-        else:
-            num_to_start = min(len(ports_to_create), len(available_gpus), needed)
-
-        if not available_gpus:
             logger.warning("Warning: Cannot restore replicas, no free GPUs available.")
             return
 
+        num_to_start = min(len(ports_to_create), len(available_gpus), needed)
+        
         if num_to_start > 0:
             logger.info(f"Found resources to start {num_to_start} new instance(s).")
             
@@ -871,8 +578,7 @@ class ModelServicePool:
                 self._add_new_service_instance(
                     ports_to_create[i], 
                     available_gpus[i], 
-                    self.default_ckpt_path,
-                    self.default_lora_adapter_path
+                    self.default_ckpt_path
                 ) for i in range(num_to_start)
             ]
             instances = await asyncio.gather(*tasks)
@@ -933,239 +639,6 @@ class ModelServicePool:
         except Exception:
             return False
 
-    def _get_gpu_uuid(self, gpu: GPUInstance) -> Optional[str]:
-        """Return the NVML UUID for a GPU instance."""
-        if gpu._handle is None:
-            return None
-        try:
-            uuid = pynvml.nvmlDeviceGetUUID(gpu._handle)
-            if isinstance(uuid, bytes):
-                uuid = uuid.decode("utf-8")
-            return uuid
-        except pynvml.NVMLError as e:
-            logger.warning(f"Failed to read UUID for GPU {gpu.gpu_id}: {e}")
-            return None
-
-    def _get_process_command(self, pid: int) -> str:
-        """Best-effort command line lookup for process classification."""
-        try:
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                return f.read().replace(b"\x00", b" ").decode("utf-8", errors="replace")
-        except OSError:
-            return ""
-
-    def _is_stale_model_process(self, pid: int, process_name: str) -> bool:
-        """Conservatively identify orphaned vLLM workers owned by this model service."""
-        current_pid = os.getpid()
-        if pid == current_pid:
-            return False
-
-        known_pids = {
-            inst.process.pid
-            for inst in self.service_instances.values()
-            if inst.process is not None
-        }
-        if pid in known_pids:
-            return False
-
-        cmd = self._get_process_command(pid)
-        process_text = f"{process_name} {cmd}"
-
-        if "ray::WorkerDict" in process_text:
-            return False
-        if "verl.trainer" in process_text:
-            return False
-        if "python -m src.run_model" in process_text:
-            return False
-
-        if "vllm serve" in process_text:
-            return True
-        if "multiprocessing.spawn" in process_text and "spawn_main" in process_text:
-            return True
-
-        return False
-
-    def _is_likely_stale_model_worker(self, pid: int, process_name: str, used_memory_mib: int) -> bool:
-        """
-        Fallback for container/NVML UUID mismatches.
-        Only matches large standalone Python multiprocessing workers, and still excludes
-        trainer/ray/current-service commands in _is_stale_model_process().
-        """
-        if used_memory_mib < 1024:
-            return False
-        return self._is_stale_model_process(pid, process_name)
-
-    def _scan_proc_for_stale_model_processes(self) -> List[int]:
-        """
-        Fallback for containers where nvidia-smi reports memory usage but hides process IDs.
-        This scans the container PID namespace for stale vLLM workers.
-        """
-        stale_pids = []
-        for name in os.listdir("/proc"):
-            if not name.isdigit():
-                continue
-
-            pid = int(name)
-            cmd = self._get_process_command(pid)
-            if not cmd:
-                continue
-
-            process_name = os.path.basename(cmd.split(" ", 1)[0])
-            if self._is_stale_model_process(pid, process_name):
-                stale_pids.append(pid)
-                logger.warning(
-                    f"Detected stale model process from /proc scan: pid={pid}, cmd={cmd}"
-                )
-
-        return stale_pids
-
-    async def _terminate_stale_processes(self, stale_pids: List[int]) -> bool:
-        """Terminate stale backend process groups."""
-        if not stale_pids:
-            return False
-
-        stale_pids = sorted(set(stale_pids))
-
-        for pid in stale_pids:
-            try:
-                pgid = os.getpgid(pid)
-                os.killpg(pgid, 15)
-                logger.warning(f"Sent SIGTERM to stale model process group {pgid} for pid {pid}")
-            except ProcessLookupError:
-                continue
-            except PermissionError as e:
-                logger.warning(f"No permission to terminate stale model process {pid}: {e}")
-            except OSError as e:
-                logger.warning(f"Failed to terminate stale model process {pid}: {e}")
-
-        await asyncio.sleep(5)
-
-        for pid in stale_pids:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                continue
-
-            try:
-                pgid = os.getpgid(pid)
-                os.killpg(pgid, 9)
-                logger.warning(f"Sent SIGKILL to stale model process group {pgid} for pid {pid}")
-            except ProcessLookupError:
-                continue
-            except PermissionError as e:
-                logger.warning(f"No permission to kill stale model process {pid}: {e}")
-            except OSError as e:
-                logger.warning(f"Failed to kill stale model process {pid}: {e}")
-
-        return True
-
-    async def _cleanup_stale_model_processes(self) -> bool:
-        """
-        Clean orphaned vLLM workers on GPUs visible to this service.
-        This handles the case where the pool has 0 instances, no ports are listening,
-        but dead backend workers still hold GPU memory and block recovery.
-        """
-        visible_uuids = {
-            uuid for uuid in (
-                self._get_gpu_uuid(gpu) for gpu in self.gpu_instances.values()
-            )
-            if uuid
-        }
-        if not visible_uuids:
-            logger.warning(
-                "Stale model cleanup could not read visible GPU UUIDs; falling back to /proc scan."
-            )
-            return await self._terminate_stale_processes(
-                self._scan_proc_for_stale_model_processes()
-            )
-
-        logger.warning(
-            f"Checking for stale model processes on visible GPU UUIDs: {sorted(visible_uuids)}"
-        )
-
-        try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                [
-                    "nvidia-smi",
-                    "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
-                    "--format=csv,noheader,nounits",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-        except (subprocess.SubprocessError, FileNotFoundError) as e:
-            logger.warning(f"Failed to query GPU processes for stale cleanup: {e}")
-            return await self._terminate_stale_processes(
-                self._scan_proc_for_stale_model_processes()
-            )
-
-        if result.returncode != 0:
-            logger.warning(f"nvidia-smi process query failed: {result.stderr}")
-            return await self._terminate_stale_processes(
-                self._scan_proc_for_stale_model_processes()
-            )
-
-        stale_pids = []
-        seen_visible_gpu_process = False
-        fallback_stale_pids = []
-        for line in result.stdout.splitlines():
-            parts = [part.strip() for part in line.split(",")]
-            if len(parts) < 4:
-                continue
-
-            gpu_uuid, pid_text, process_name, used_memory = parts[:4]
-            try:
-                pid = int(pid_text)
-                used_memory_mib = int(used_memory)
-            except ValueError:
-                continue
-
-            logger.info(
-                f"Observed GPU process during stale cleanup: gpu_uuid={gpu_uuid}, "
-                f"pid={pid}, process={process_name}, used_memory={used_memory_mib}MiB"
-            )
-
-            if gpu_uuid in visible_uuids:
-                seen_visible_gpu_process = True
-            elif self._is_likely_stale_model_worker(pid, process_name, used_memory_mib):
-                fallback_stale_pids.append(pid)
-                logger.warning(
-                    f"Detected likely stale model process with unmatched GPU UUID: "
-                    f"gpu_uuid={gpu_uuid}, pid={pid}, process={process_name}, "
-                    f"used_memory={used_memory_mib}MiB"
-                )
-                continue
-            else:
-                continue
-
-            if self._is_stale_model_process(pid, process_name):
-                stale_pids.append(pid)
-                logger.warning(
-                    f"Detected stale model process on visible GPU: "
-                    f"pid={pid}, process={process_name}, used_memory={used_memory}MiB"
-                )
-
-        if not stale_pids and not seen_visible_gpu_process and fallback_stale_pids:
-            logger.warning(
-                "No GPU process UUID matched the service-visible UUIDs; "
-                "using likely stale model worker fallback."
-            )
-            stale_pids = fallback_stale_pids
-
-        if not stale_pids:
-            logger.warning(
-                "No stale model processes found from nvidia-smi; falling back to /proc scan."
-            )
-            stale_pids = self._scan_proc_for_stale_model_processes()
-
-        if not stale_pids:
-            logger.warning("No stale model processes found during cleanup.")
-            return False
-
-        return await self._terminate_stale_processes(stale_pids)
-
     async def _wait_for_service_ready(self, instance: ServiceInstance, timeout: int = 1200) -> bool:
         """Wait for the service on the specified GPU to be ready."""
         start_time = time.time()
@@ -1219,61 +692,27 @@ class ModelServicePool:
 
     def _get_gpu_count(self) -> int:
         """Get available GPU count."""
-        return len(self._get_visible_gpu_devices())
-
-    def _get_visible_gpu_devices(self) -> List[str]:
-        """Return CUDA-visible GPU identifiers, preserving CUDA_VISIBLE_DEVICES mapping."""
         if "CUDA_VISIBLE_DEVICES" in os.environ:
             devices = os.environ["CUDA_VISIBLE_DEVICES"]
             if devices:
-                return [device.strip() for device in devices.split(",") if device.strip()]
+                return len(devices.split(","))
         try:
             result = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
             if result.returncode == 0:
                 lines = result.stdout.strip().split('\n')
-                return [
-                    str(index)
-                    for index, line in enumerate(lines)
-                    if line.startswith('GPU ')
-                ]
+                return len([line for line in lines if line.startswith('GPU ')])
         except (subprocess.SubprocessError, FileNotFoundError):
             pass
-        return []
-
-    def _cuda_visible_device_to_nvml_index(self, cuda_visible_device: str) -> int:
-        """Map CUDA_VISIBLE_DEVICES entries to NVML indices for memory checks."""
-        if cuda_visible_device.isdigit():
-            return int(cuda_visible_device)
-
-        try:
-            target_uuid = cuda_visible_device
-            device_count = pynvml.nvmlDeviceGetCount()
-            for index in range(device_count):
-                handle = pynvml.nvmlDeviceGetHandleByIndex(index)
-                uuid = pynvml.nvmlDeviceGetUUID(handle)
-                if isinstance(uuid, bytes):
-                    uuid = uuid.decode("utf-8")
-                if uuid == target_uuid:
-                    return index
-        except pynvml.NVMLError as e:
-            logger.error(f"Failed to map CUDA device {cuda_visible_device} to NVML index: {e}")
-
-        logger.warning(
-            f"Could not map CUDA_VISIBLE_DEVICES entry {cuda_visible_device}; "
-            "falling back to NVML index 0."
-        )
         return 0
 
     def _get_available_gpus(self) -> List[int]:
         """Get list of all GPU IDs."""
-        return list(self.gpu_instances.keys())
+        return list(range(self._get_gpu_count()))
 
-    async def _stream_process_output(self, instance: ServiceInstance, max_log_length: int = 400):
+    async def _stream_process_output(self, proc: subprocess.Popen, port: int, max_log_length: int = 400):
         """Asynchronously read and print subprocess output stream, truncate overly long content."""
         import re
         ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-        proc = instance.process
-        port = instance.port
 
         async def reader(stream, prefix):
             while True:
@@ -1297,61 +736,20 @@ class ModelServicePool:
 
         stdout_task.cancel()
         stderr_task.cancel()
-
-        if not self.shutting_down:
-            logger.warning(
-                f"Service process on GPU {instance.gpu_id}, port {port} exited. "
-                "Removing it from pool and starting recovery."
-            )
-            await self._remove_service_instance(
-                instance.gpu_id,
-                kill=False,
-                expected_instance=instance,
-            )
-            await self._recover_replicas_now(f"process exit on port {port}")
         
     
     @asynccontextmanager
     async def _get_endpoint_for_request(self):
         """Use async context manager to gracefully handle endpoint acquisition and counter management."""
         instance = None
-        dead_instances = []
         try:
             async with self.instances_lock:
                 active_instances = list(self.service_instances.values())
-                for active_instance in active_instances:
-                    if active_instance.process and active_instance.process.poll() is not None:
-                        dead_instances.append(active_instance)
-
-                active_instances = [
-                    active_instance
-                    for active_instance in active_instances
-                    if active_instance.process and active_instance.process.poll() is None
-                ]
-
                 if not active_instances:
-                    for dead_instance in dead_instances:
-                        asyncio.create_task(
-                            self._remove_service_instance(
-                                dead_instance.gpu_id,
-                                expected_instance=dead_instance,
-                            )
-                        )
-                    asyncio.create_task(self._recover_replicas_now("no live endpoints"))
                     raise Exception("No available endpoints in the pool.")
                 
                 instance = min(active_instances, key=lambda x: x.requests_in_flight)
                 instance.requests_in_flight += 1
-
-            for dead_instance in dead_instances:
-                asyncio.create_task(
-                    self._remove_service_instance(
-                        dead_instance.gpu_id,
-                        expected_instance=dead_instance,
-                    )
-                )
-            if dead_instances:
-                asyncio.create_task(self._recover_replicas_now("dead endpoint skipped"))
             
             logger.info(f"Routing request to {instance.endpoint} (GPU {instance.gpu_id}, in-flight: {instance.requests_in_flight})")
             yield instance
@@ -1359,19 +757,7 @@ class ModelServicePool:
         finally:
             if instance:
                 async with self.instances_lock:
-                    instance.requests_in_flight = max(0, instance.requests_in_flight - 1)
-
-    async def _quarantine_failed_instance(self, instance: ServiceInstance, reason: str):
-        """Remove a failed instance and trigger async replica recovery."""
-        logger.warning(
-            f"Quarantining service on GPU {instance.gpu_id}, port {instance.port}: {reason}"
-        )
-        await self._remove_service_instance(
-            instance.gpu_id,
-            kill=True,
-            expected_instance=instance,
-        )
-        asyncio.create_task(self._recover_replicas_now(reason))
+                    instance.requests_in_flight -= 1
 
     async def generate(self, messages: List[Dict[str, Any]], **kwargs) -> str:
         """Use load balancing strategy to send a chat request to the model service pool."""
@@ -1385,26 +771,12 @@ class ModelServicePool:
                     )
                 
                 url = f"{instance.endpoint}/v1/chat/completions"
-                data = {"model": instance.served_model_name, "messages": messages, **kwargs}
+                data = {"model": instance.ckpt_path, "messages": messages, **kwargs}
 
                 if self.save_local:
                     try:
-                        if self.model_cfg.enable_qwen3_vllm_options:
-                            last_image_item = next(
-                                (
-                                    item
-                                    for message in reversed(messages)
-                                    for item in reversed(message.get("content", []))
-                                    if isinstance(item, dict) and item.get("type") == "image_url"
-                                ),
-                                None,
-                            )
-                            if last_image_item is None:
-                                raise ValueError("No image_url item found in Qwen3 messages.")
-                        else:
-                            last_image_item = messages[-1]["content"][-1]
-                            assert last_image_item.get("type") == "image_url"
-
+                        last_image_item = messages[-1]["content"][-1]
+                        assert last_image_item.get("type") == "image_url"
                         last_image_url = last_image_item.get("image_url", {}).get("url", "")
                         assert last_image_url.startswith("data:image")
                         header, encoded = last_image_url.split(",", 1)
@@ -1421,98 +793,72 @@ class ModelServicePool:
                         logger.error(f"❌ Failed to decode or save image: {e}")
                         raise
 
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(url, json=data) as response:
-                            if not response.ok:
-                                error_text = await response.text()
-                                raise HTTPException(status_code=response.status, detail=f"API call failed: {error_text}")
-                            
-                            response_data = await response.json()
-                            if instance.lora_adapter_path:
-                                response_data["model"] = instance.model_version
-                except (
-                    aiohttp.ClientConnectionError,
-                    aiohttp.ServerDisconnectedError,
-                    aiohttp.ClientOSError,
-                    asyncio.TimeoutError,
-                ) as e:
-                    await self._quarantine_failed_instance(
-                        instance,
-                        f"generate connection failure: {e}",
-                    )
-                    raise HTTPException(
-                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                        detail=f"Model backend disconnected; recovery started: {e}",
-                    )
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=data) as response:
+                        if not response.ok:
+                            error_text = await response.text()
+                            raise HTTPException(status_code=response.status, detail=f"API call failed: {error_text}")
                         
-                if self.save_local:
-                    try:
-                        content = response_data["choices"][0]["message"]["content"]
-                        model = response_data["model"]
-
-                        logp_list, token_id_list = None, None
-
-                        # If logprobs requested in parameters
-                        if kwargs.get("logprobs", False):
-                            try:
-                                logp_list = [
-                                    item["logprob"]
-                                    for item in response_data["choices"][0]["logprobs"]["content"]
-                                ]
-                            except (KeyError, IndexError, TypeError):
-                                logp_list = None
-
-                        # If return token_id requested in parameters
-                        if kwargs.get("return_tokens_as_token_ids", False):
-                            try:
-                                token_id_list = [
-                                    int(item["token"].split("token_id:")[1])
-                                    for item in response_data["choices"][0]["logprobs"]["content"]
-                                    if "token_id:" in item["token"]
-                                ]
-                            except (KeyError, IndexError, TypeError, ValueError):
-                                token_id_list = None
+                        response_data = await response.json()
                         
-                        task_id = kwargs.get("task_id")
-                        trace_id = kwargs.get("trace_id")
-                        step = kwargs.get("step")
-                        save_dir = os.path.join(self.save_path, f"{task_id}_{trace_id}")
-                        os.makedirs(save_dir, exist_ok=True)
-                        save_path = os.path.join(save_dir, f"data_for_step_{int(step)+1}.pt")
+                        if self.save_local:
+                            try:
+                                content = response_data["choices"][0]["message"]["content"]
+                                model = response_data["model"]
 
-                        data_to_save = {
-                            "logp": torch.tensor(logp_list).cpu() if logp_list is not None else torch.tensor([]).cpu(),
-                            "token_ids": torch.tensor(token_id_list).cpu() if token_id_list is not None else torch.tensor([]).cpu(),
-                        }
+                                logp_list, token_id_list = None, None
 
-                        torch.save(data_to_save, save_path)
-                    except Exception as e:
-                        logger.error(f"❌ Failed to save logp/token_id tensors: {e}")
-                        raise
+                                # If logprobs requested in parameters
+                                if kwargs.get("logprobs", False):
+                                    try:
+                                        logp_list = [
+                                            item["logprob"]
+                                            for item in response_data["choices"][0]["logprobs"]["content"]
+                                        ]
+                                    except (KeyError, IndexError, TypeError):
+                                        logp_list = None
 
-                try:
-                    return response_data
-                except (KeyError, IndexError, TypeError) as e:
-                    raise HTTPException(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-                        detail=f"Failed to parse response: {e}. Full response: {response_data}"
-                    )
+                                # If return token_id requested in parameters
+                                if kwargs.get("return_tokens_as_token_ids", False):
+                                    try:
+                                        token_id_list = [
+                                            int(item["token"].split("token_id:")[1])
+                                            for item in response_data["choices"][0]["logprobs"]["content"]
+                                            if "token_id:" in item["token"]
+                                        ]
+                                    except (KeyError, IndexError, TypeError, ValueError):
+                                        token_id_list = None
+                                
+                                task_id = kwargs.get("task_id")
+                                trace_id = kwargs.get("trace_id")
+                                step = kwargs.get("step")
+                                save_dir = os.path.join(self.save_path, f"{task_id}_{trace_id}")
+                                os.makedirs(save_dir, exist_ok=True)
+                                save_path = os.path.join(save_dir, f"data_for_step_{int(step)+1}.pt")
 
-        except HTTPException:
-            raise
+                                data_to_save = {
+                                    "logp": torch.tensor(logp_list).cpu() if logp_list is not None else torch.tensor([]).cpu(),
+                                    "token_ids": torch.tensor(token_id_list).cpu() if token_id_list is not None else torch.tensor([]).cpu(),
+                                }
+
+                                torch.save(data_to_save, save_path)
+                            except Exception as e:
+                                logger.error(f"❌ Failed to save logp/token_id tensors: {e}")
+                                raise
+
+                        try:
+                            return response_data
+                        except (KeyError, IndexError, TypeError) as e:
+                            raise HTTPException(
+                                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+                                detail=f"Failed to parse response: {e}. Full response: {response_data}"
+                            )
+
         except Exception as e:
             logger.error(f"Error during generate call: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-    async def save(
-        self,
-        messages: List[Dict],
-        reward: float,
-        task_id: str,
-        trace_id: str,
-        parsed_actions: Optional[List[Dict[str, Any]]] = None,
-    ):
+    async def save(self, messages: List[Dict], reward: float, task_id: str, trace_id: str):
         if not self.save_local:
             return {"status": "skipped"}
 
@@ -1524,11 +870,6 @@ class ModelServicePool:
             messages_path = os.path.join(save_dir, f"final_messages.json")
             with open(messages_path, "w", encoding="utf-8") as f:
                 json.dump(messages, f, ensure_ascii=False, indent=2)
-
-            if parsed_actions is not None:
-                parsed_actions_path = os.path.join(save_dir, "parsed_actions.json")
-                with open(parsed_actions_path, "w", encoding="utf-8") as f:
-                    json.dump(parsed_actions, f, ensure_ascii=False, indent=2)
 
             # Save reward
             reward_path = os.path.join(save_dir, f"reward.txt")
@@ -1555,40 +896,22 @@ class ModelServicePool:
                     )
 
                 url = f"{instance.endpoint}/tokenize"
-                data = {"model": instance.served_model_name, "prompt": input_text}
+                data = {"model": instance.ckpt_path, "prompt": input_text}
 
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(url, json=data) as response:
-                            if not response.ok:
-                                error_text = await response.text()
-                                raise HTTPException(status_code=response.status, detail=f"Tokenize API failed: {error_text}")
-                            
-                            response_data = await response.json()
-                except (
-                    aiohttp.ClientConnectionError,
-                    aiohttp.ServerDisconnectedError,
-                    aiohttp.ClientOSError,
-                    asyncio.TimeoutError,
-                ) as e:
-                    await self._quarantine_failed_instance(
-                        instance,
-                        f"tokenize connection failure: {e}",
-                    )
-                    raise HTTPException(
-                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                        detail=f"Model backend disconnected; recovery started: {e}",
-                    )
-
-                try:
-                    return response_data
-                except (KeyError, IndexError, TypeError) as e:
-                    raise HTTPException(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail=f"Failed to parse tokenize response: {e}. Full response: {response_data}"
-                    )
-        except HTTPException:
-            raise
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=data) as response:
+                        if not response.ok:
+                            error_text = await response.text()
+                            raise HTTPException(status_code=response.status, detail=f"Tokenize API failed: {error_text}")
+                        
+                        response_data = await response.json()
+                        try:
+                            return response_data
+                        except (KeyError, IndexError, TypeError) as e:
+                            raise HTTPException(
+                                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                detail=f"Failed to parse tokenize response: {e}. Full response: {response_data}"
+                            )
         except Exception as e:
             logger.error(f"Error during tokenize call: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
@@ -1637,20 +960,15 @@ class ModelServicePool:
             
         return available_ports[:count]
 
-    async def reload(self, new_ckpt_path: str, lora_adapter_path: Optional[str] = None):
+    async def reload(self, new_ckpt_path: str):
         """
         Full delete and restart mode, temporarily not providing fastapi interface
         """
-        new_ckpt_path = self._resolve_checkpoint_path(new_ckpt_path)
-        logger.info(f"\n--- Reloading model pool to: {new_ckpt_path}, lora_adapter_path={lora_adapter_path} ---")
-        self._validate_model_path(new_ckpt_path)
-        if lora_adapter_path:
-            self._validate_lora_adapter_path(lora_adapter_path)
+        logger.info(f"\n--- Reloading model pool to: {new_ckpt_path} ---")
         
         # Update configuration
         async with self.config_lock:
             self.default_ckpt_path = new_ckpt_path
-            self.default_lora_adapter_path = lora_adapter_path
         
         # Pause background monitoring
         if self.monitoring_task and not self.monitoring_task.done():
@@ -1665,94 +983,59 @@ class ModelServicePool:
         logger.info("--- Model pool reloaded successfully ---")
         return True
 
-    async def roll_reload(self, new_ckpt_path: str, batch_size: int = 1, lora_adapter_path: Optional[str] = None):
+    async def roll_reload(self, new_ckpt_path: str, batch_size: int = 1):
         """
         Smoothly reload the model through rolling updates.
         Update [batch_size] instances at a time.
         """
-        requested_ckpt_path = new_ckpt_path
-        requested_lora_adapter_path = lora_adapter_path
-        new_ckpt_path = self._resolve_checkpoint_path(new_ckpt_path)
-        if lora_adapter_path:
-            self._validate_lora_adapter_path(lora_adapter_path)
 
         if self.replicas >= 4:
             batch_size = max(2, batch_size)
         if self.replicas < 4:
             batch_size = 1
 
-        logger.info(
-            f"\n--- Rolling reload to new model: {new_ckpt_path} "
-            f"lora_adapter_path={lora_adapter_path} "
-            f"(requested: {requested_ckpt_path}, requested_lora: {requested_lora_adapter_path}, batch size: {batch_size}) ---"
-        )
-        self._validate_model_path(new_ckpt_path)
+        logger.info(f"\n--- Rolling reload to new model: {new_ckpt_path} (batch size: {batch_size}) ---")
         
         # Pause background monitoring to prevent interference with update process
         if self.monitoring_task and not self.monitoring_task.done():
             logger.info("pause monitoring task")
             self.monitoring_task.cancel()
 
-        # Quickly get current instance information (hold lock for very short time)
+        # Quickly get old instance information (hold lock for very short time)
         async with self.instances_lock:
-            current_instances = list(self.service_instances.values())
             old_instances_gpu_ids = [
-                inst.gpu_id for inst in current_instances
-                if inst.ckpt_path != new_ckpt_path or inst.lora_adapter_path != lora_adapter_path
+                inst.gpu_id for inst in self.service_instances.values()
+                if inst.ckpt_path != new_ckpt_path
             ]
         
         logger.info(f">>>>> old gpu ids : {old_instances_gpu_ids}")
-
-        # Set default model path before any early return. If all backends are down
-        # during reload, recovery must still start the requested checkpoint.
-        async with self.config_lock:
-            if self.default_ckpt_path != new_ckpt_path or self.default_lora_adapter_path != lora_adapter_path:
-                self.last_ckpt_path = self.default_ckpt_path
-                self.last_lora_adapter_path = self.default_lora_adapter_path
-                self.default_ckpt_path = new_ckpt_path
-                self.default_lora_adapter_path = lora_adapter_path
-
-        if not current_instances:
-            logger.warning(
-                "No active model instances during reload; updated default checkpoint "
-                f"to {new_ckpt_path} and will restore replicas with this checkpoint."
-            )
-            try:
-                await self._ensure_replicas()
-            finally:
-                logger.info("restart monitoring task")
-                self.monitoring_task = asyncio.create_task(self._monitor_replicas())
-            logger.info(f"--- Rolling reload finished with new model: {new_ckpt_path}, lora_adapter_path={lora_adapter_path} ---")
-            return True
-
+        
         if not old_instances_gpu_ids:
             logger.info("All instances are already running the target model. Reload skipped.")
             # Restart monitoring
             self.monitoring_task = asyncio.create_task(self._monitor_replicas())
             return True
 
-        # Update in batches, yield control between batches
-        try:
-            for i in range(0, len(old_instances_gpu_ids), batch_size):
-                batch_gpu_ids = old_instances_gpu_ids[i:i + batch_size]
-                logger.info(f"--- Reloading batch: GPUs {batch_gpu_ids} ---")
+        # Set default model path to new path
+        async with self.config_lock:
+            self.last_ckpt_path = self.default_ckpt_path
+            self.default_ckpt_path = new_ckpt_path
 
-                # 1. Remove old instances
-                logger.info(f"Removing {len(batch_gpu_ids)} old instance(s)...")
-                await self._shutdown_n_services(batch_gpu_ids)
-                
-                # 2. Start new instances
-                logger.info(f"Adding {len(batch_gpu_ids)} new instance(s) with new model...")
-                await self._add_n_service_instance(len(batch_gpu_ids))
-                
-                # Yield control to allow other coroutines to execute
-                await asyncio.sleep(0)
-        except Exception:
-            async with self.config_lock:
-                self.default_ckpt_path = self.last_ckpt_path
-                self.default_lora_adapter_path = self.last_lora_adapter_path
-            logger.exception("Rolling reload failed; restored previous default checkpoint path.")
-            raise
+        # Update in batches, yield control between batches
+        for i in range(0, len(old_instances_gpu_ids), batch_size):
+            batch_gpu_ids = old_instances_gpu_ids[i:i + batch_size]
+            logger.info(f"--- Reloading batch: GPUs {batch_gpu_ids} ---")
+
+            # 1. Remove old instances
+            logger.info(f"Removing {len(batch_gpu_ids)} old instance(s)...")
+            await self._shutdown_n_services(batch_gpu_ids)
+            
+            # 2. Start new instances
+            logger.info(f"Adding {len(batch_gpu_ids)} new instance(s) with new model...")
+            await self._add_n_service_instance(len(batch_gpu_ids))
+            
+            # Yield control to allow other coroutines to execute
+            await asyncio.sleep(0)
 
         # Restart background monitoring
         logger.info("restart monitoring task")
@@ -1779,9 +1062,6 @@ class ModelServicePool:
                     "port": inst.port,
                     "endpoint": inst.endpoint,
                     "ckpt_path": inst.ckpt_path,
-                    "lora_adapter_path": inst.lora_adapter_path,
-                    "served_model_name": inst.served_model_name,
-                    "model_version": inst.model_version,
                     "requests_in_flight": inst.requests_in_flight,
                     "pid": inst.process.pid if inst.process else None
                 }
@@ -1804,9 +1084,5 @@ class ModelServicePool:
         async with self.config_lock:
             return {
                 "current_ckpt_path": self.default_ckpt_path,
-                "current_lora_adapter_path": self.default_lora_adapter_path,
-                "current_model_version": self.default_lora_adapter_path or self.default_ckpt_path,
-                "last_ckpt_path": self.last_ckpt_path,
-                "last_lora_adapter_path": self.last_lora_adapter_path,
-                "last_model_version": self.last_lora_adapter_path or self.last_ckpt_path
+                "last_ckpt_path": self.last_ckpt_path
             }

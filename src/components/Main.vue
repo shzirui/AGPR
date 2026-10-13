@@ -23,10 +23,6 @@ const base = import.meta.env.BASE_URL
       </div>
 
       <div class="links">
-        <a class="link-button" href="https://github.com/shzirui/AGPR/tree/main/paper" target="_blank">
-          <i class="fas fa-file-pdf"></i>
-          <span>Paper</span>
-        </a>
         <a class="link-button" href="https://github.com/shzirui/AGPR" target="_blank">
           <i class="fab fa-github"></i>
           <span>Code</span>

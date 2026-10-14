@@ -2,11 +2,12 @@
 
 <p align="center">
   <a href="https://shzirui.github.io/AGPR/"><img src="https://img.shields.io/badge/Website-AGPR-2663ff" alt="Website"></a>
+  <a href="https://arxiv.org/abs/2610.17710"><img src="https://img.shields.io/badge/Paper-arXiv-b31b1b" alt="Paper"></a>
   <a href="https://github.com/shzirui/AGPR"><img src="https://img.shields.io/badge/Code-GitHub-black" alt="Code"></a>
 </p>
 
 <p align="center">
-&nbsp;&nbsp;🌐 <a href="https://shzirui.github.io/AGPR/">Website</a>&nbsp;&nbsp; | &nbsp;&nbsp;💻 <a href="https://github.com/shzirui/AGPR">Code</a>&nbsp;&nbsp;
+&nbsp;&nbsp;🌐 <a href="https://shzirui.github.io/AGPR/">Website</a>&nbsp;&nbsp; | &nbsp;&nbsp;📑 <a href="https://arxiv.org/abs/2610.17710">Paper</a>&nbsp;&nbsp; | &nbsp;&nbsp;💻 <a href="https://github.com/shzirui/AGPR">Code</a>&nbsp;&nbsp;
 </p>
 
 This repository extends the [DART-GUI](https://github.com/computer-use-agents/dart-gui) training infrastructure with **adaptive-group process rewards**. A completed GUI trajectory is partitioned into subgoal groups. A critic scores each action and each group, and the resulting process rewards shape GRPO's step-level advantage.
@@ -122,4 +123,14 @@ This repository is built on [DART-GUI](https://github.com/computer-use-agents/da
 
 ## Citation
 
-The citation will be added after the arXiv version is posted.
+```bibtex
+@misc{shang2026adaptivegroupprocessrewardsgui,
+  title={Adaptive-Group Process Rewards for GUI Agents},
+  author={Zirui Shang and Yang Liu and Xin Shu and Zhi Gao and Xinxiao Wu and Lifeng Fan},
+  year={2026},
+  eprint={2610.17710},
+  archivePrefix={arXiv},
+  primaryClass={cs.AI},
+  url={https://arxiv.org/abs/2610.17710},
+}
+```

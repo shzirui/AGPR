@@ -1,11 +1,11 @@
-"""Select the process-reward scorer. Default is v2.1; v2.2 is opt-in."""
+"""Select the process-reward scorer. Default is lookup; numeric is opt-in."""
 
 from types import SimpleNamespace
 
 
 def resolve_process_reward_scoring(version) -> SimpleNamespace:
-    name = str(version or "v2_1").strip().lower().replace(".", "_").replace("-", "_")
-    if name in {"v2_1", "v21", "2_1"}:
+    name = str(version or "lookup").strip().lower().replace(".", "_").replace("-", "_")
+    if name in {"lookup", "v2_1", "v21", "2_1"}:
         from src.core.group import async_group_steps
         from src.core.group_multi import async_group_steps as async_group_steps_multi
         from src.core.prm_validation import (
@@ -48,7 +48,7 @@ def resolve_process_reward_scoring(version) -> SimpleNamespace:
             )
 
         return SimpleNamespace(
-            name="v2_1",
+            name="lookup",
             errors=(KeyError, PRMValidationError),
             group_single=async_group_steps,
             group_multi=async_group_steps_multi,
@@ -63,7 +63,7 @@ def resolve_process_reward_scoring(version) -> SimpleNamespace:
             previous_group_line=previous_group_line,
         )
 
-    if name in {"v2_2", "v22", "2_2"}:
+    if name in {"numeric", "v2_2", "v22", "2_2"}:
         from src.core.group_multi import async_group_steps as async_group_steps_multi
         from src.core.scoring_v2_2.group import async_group_steps
         from src.core.scoring_v2_2.prm_validation import (
@@ -104,7 +104,7 @@ def resolve_process_reward_scoring(version) -> SimpleNamespace:
             )
 
         return SimpleNamespace(
-            name="v2_2",
+            name="numeric",
             errors=(KeyError, PRMValidationError),
             group_single=async_group_steps,
             group_multi=async_group_steps_multi,
@@ -120,5 +120,5 @@ def resolve_process_reward_scoring(version) -> SimpleNamespace:
         )
 
     raise ValueError(
-        f"Unsupported process_reward.scoring_version={version!r}; expected v2_1 or v2_2"
+        f"Unsupported process_reward.scoring_version={version!r}; expected lookup or numeric"
     )

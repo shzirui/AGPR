@@ -23,7 +23,7 @@ process_reward:
   release_env_before_evaluation: True
   max_concurrent_jobs: 8
   mode: "multi"
-  scoring_version: "v2_1"  # v2_1 | v2_2
+  scoring_version: "lookup"  # lookup | numeric
   enable_phase3: True
   loop_limit: 8
   preprocess_concurrency: 8

@@ -86,7 +86,7 @@ class TrajectoryRunnerActor:
         self.pr_mode = str(getattr(process_reward_cfg, "mode", "single")).lower()
         self.enable_pr_phase3 = bool(getattr(process_reward_cfg, "enable_phase3", False))
         self.pr_scoring = resolve_process_reward_scoring(
-            getattr(process_reward_cfg, "scoring_version", "v2_1")
+            getattr(process_reward_cfg, "scoring_version", "lookup")
         )
         # self.save_img_pt = self.runner_cfg.save_img_pt
         # self.rollout_n = self.runner_cfg.rollout_n

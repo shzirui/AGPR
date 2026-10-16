@@ -255,54 +255,6 @@ def compute_grpo_outcome_advantage(
     return scores, scores
 
 
-def compute_stepwise_grpo_advantage(
-    token_level_rewards: torch.Tensor,
-    response_mask: torch.Tensor,
-    uid_index: np.ndarray,
-    step_index: np.ndarray,
-    norm_adv_by_std_in_grpo: bool = True,
-):
-    """
-    [核心算法] 计算步级 GRPO 优势 (Step-wise GRPO)
-    二维正交分组：按 Task ID (uid) 和 时间步 (step_idx) 分组。
-    """
-    returns_scalar = token_level_rewards.sum(dim=-1)
-    B = returns_scalar.shape[0]
-        
-    adv_scalars = torch.zeros_like(returns_scalar)
-    
-    unique_uids = set(uid_index)
-    for uid in unique_uids:
-        uid_mask = [i for i, x in enumerate(uid_index) if x == uid]
-        
-        step_to_idxs = defaultdict(list)
-        for idx in uid_mask:
-            step = step_index[idx]
-            if hasattr(step, 'item'): step = step.item()
-            step_to_idxs[step].append(idx)
-            
-        for step, idxs in step_to_idxs.items():
-            if step == -1:
-                continue
-
-            tensor_idxs = torch.tensor(idxs, device=returns_scalar.device)
-            step_returns = returns_scalar[tensor_idxs]
-            
-            if len(step_returns) > 1:
-                mean_r = step_returns.mean()
-                std_r = step_returns.std() + 1e-6 if norm_adv_by_std_in_grpo else 1.0
-                step_adv = (step_returns - mean_r) / std_r
-            else:
-                step_adv = torch.zeros_like(step_returns)
-                
-            adv_scalars[tensor_idxs] = step_adv
-
-    advantages = adv_scalars.unsqueeze(-1) * response_mask.float()
-    returns = returns_scalar.unsqueeze(-1) * response_mask.float()
-    
-    return advantages, returns
-
-
 def compute_process_outcome_group_advantage(
     outcome_rewards: torch.Tensor,
     process_rewards: torch.Tensor,
@@ -331,7 +283,7 @@ def compute_process_outcome_group_advantage(
     }
     mismatched = {name: size for name, size in fields.items() if size != batch_size}
     if mismatched:
-        raise ValueError(f"Mode 3 PR batch fields do not align with batch size {batch_size}: {mismatched}")
+        raise ValueError(f"Process-reward batch fields do not align with batch size {batch_size}: {mismatched}")
 
     advantage_scalars = torch.zeros_like(outcome_scores)
     unique_uids = list(dict.fromkeys(uid_index.tolist()))
@@ -396,87 +348,10 @@ def compute_process_outcome_group_advantage(
                 advantage_scalars[i] = outcome_advantage + process_weight * process_advantage
 
             print(
-                f"[PR_MODE_3] uid={uid}, trajectories={len(trajectory_outcomes)}, "
+                f"[PR] uid={uid}, trajectories={len(trajectory_outcomes)}, "
                 f"process_steps={len(process_by_step)}, outcome_mean={outcome_mean.item():.6f}, "
                 f"outcome_std={outcome_std.item():.6f}, process_mean={process_mean.item():.6f}, "
                 f"process_std={process_std.item():.6f}, eta={process_weight:.6f}"
-            )
-
-    advantages = advantage_scalars.unsqueeze(-1) * response_mask.float()
-    return advantages, advantages.clone()
-
-
-def compute_joint_process_outcome_group_advantage(
-    outcome_rewards: torch.Tensor,
-    process_rewards: torch.Tensor,
-    response_mask: torch.Tensor,
-    uid_index: np.ndarray,
-    trajectory_index: np.ndarray,
-    step_index: np.ndarray,
-    process_weight: float = 0.3,
-    epsilon: float = 1e-6,
-):
-    """Normalize outcome-plus-process scores over all unique steps in each instruction group."""
-    if outcome_rewards.ndim > 1:
-        outcome_scores = outcome_rewards.sum(dim=-1)
-    else:
-        outcome_scores = outcome_rewards
-    outcome_scores = outcome_scores.float()
-    process_scores = process_rewards.to(device=outcome_scores.device, dtype=torch.float32).reshape(-1)
-
-    batch_size = outcome_scores.shape[0]
-    fields = {
-        "process_rewards": process_scores.shape[0],
-        "response_mask": response_mask.shape[0],
-        "uid_index": len(uid_index),
-        "trajectory_index": len(trajectory_index),
-        "step_index": len(step_index),
-    }
-    mismatched = {name: size for name, size in fields.items() if size != batch_size}
-    if mismatched:
-        raise ValueError(f"Mode 4 PR batch fields do not align with batch size {batch_size}: {mismatched}")
-
-    advantage_scalars = torch.zeros_like(outcome_scores)
-    unique_uids = list(dict.fromkeys(uid_index.tolist()))
-
-    with torch.no_grad():
-        for uid in unique_uids:
-            if uid == "padding":
-                continue
-
-            group_indices = [i for i, value in enumerate(uid_index) if value == uid]
-            score_by_step = {}
-            row_scores = {}
-
-            for i in group_indices:
-                process_score = process_scores[i]
-                if not torch.isfinite(process_score) or process_score.item() == -1:
-                    process_score = torch.zeros((), device=outcome_scores.device)
-                joint_score = outcome_scores[i] + process_weight * process_score
-                step_key = (str(trajectory_index[i]), int(step_index[i]))
-                previous = score_by_step.get(step_key)
-                if previous is not None and not torch.isclose(previous, joint_score, atol=epsilon, rtol=0):
-                    raise ValueError(
-                        f"Inconsistent joint scores for uid={uid}, trajectory={step_key[0]}, "
-                        f"step={step_key[1]}: {previous.item()} vs {joint_score.item()}"
-                    )
-                score_by_step.setdefault(step_key, joint_score)
-                row_scores[i] = joint_score
-
-            grouped_scores = torch.stack(list(score_by_step.values()))
-            score_mean = grouped_scores.mean()
-            if grouped_scores.numel() > 1:
-                score_std = grouped_scores.std()
-            else:
-                score_std = torch.zeros((), device=outcome_scores.device)
-
-            for i in group_indices:
-                advantage_scalars[i] = (row_scores[i] - score_mean) / (score_std + epsilon)
-
-            print(
-                f"[PR_MODE_4] uid={uid}, unique_steps={len(score_by_step)}, "
-                f"score_mean={score_mean.item():.6f}, score_std={score_std.item():.6f}, "
-                f"lambda={process_weight:.6f}"
             )
 
     advantages = advantage_scalars.unsqueeze(-1) * response_mask.float()

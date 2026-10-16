@@ -30,13 +30,8 @@ def sample_df(x: pd.DataFrame, n: int, rng) -> pd.DataFrame:
     return x.sample(n=n, replace=False, random_state=seed)
 
 
-def combine_process_reward_value(
-    process_reward,
-    step_weight: float = 0.5,
-    group_weight: float = 0.5,
-    multiply_scores: bool = False,
-):
-    """Convert legacy or component-form PR data to a step-level list."""
+def combine_process_reward_value(process_reward):
+    """Convert stored PR data to a step-level list using action x group scores."""
     value = process_reward
     if isinstance(value, str):
         try:
@@ -58,15 +53,8 @@ def combine_process_reward_value(
         return []
 
     try:
-        step_weight = float(step_weight)
-        group_weight = float(group_weight)
-        if multiply_scores:
-            return [
-                float(step_score) * float(group_score)
-                for step_score, group_score in zip(step_scores, group_scores)
-            ]
         return [
-            step_weight * float(step_score) + group_weight * float(group_score)
+            float(step_score) * float(group_score)
             for step_score, group_score in zip(step_scores, group_scores)
         ]
     except (TypeError, ValueError):
@@ -80,12 +68,6 @@ def filter_fn(
     top_mvs: Optional[List[Any]] = None,      # 需要保留的 model_version 列表
     random_state: Optional[int] = None,        # 用于随机采样的随机种子
     acc_max: float = 1.0,
-    use_pr: str = "none",
-    use_pr_filter: bool = False,
-    pr_weight: float = 0.03,
-    pr_step_weight: float = 0.5,
-    pr_group_weight: float = 0.5,
-    pr_multiply_scores: bool = False,
 ) -> List[Dict]:
     """
     过滤规则：
@@ -99,8 +81,6 @@ def filter_fn(
     df = pd.DataFrame(data)
     if df.empty:
         return []
-
-    use_pr_scoring = str(use_pr) in {"1", "2", "3", "4"} and use_pr_filter
 
     out_cols = df.columns
     d = df.copy()
@@ -122,15 +102,7 @@ def filter_fn(
     if base.empty:
         return []
     
-    if use_pr_scoring and "process_reward" in base.columns:
-        def calc_pr_sum(pr_val):
-            pr_l = combine_process_reward_value(
-                pr_val, pr_step_weight, pr_group_weight, pr_multiply_scores
-            )
-            return sum(x for x in pr_l if x != -1)
-        base["score"] = base["reward"] + pr_weight * base["process_reward"].apply(calc_pr_sum)
-    else:
-        base["score"] = base["reward"]
+    base["score"] = base["reward"]
 
     # 3) 分组 size>=limit & mean(reward)∈[0,1)
     grp = base.groupby("task_id").agg(
@@ -140,13 +112,7 @@ def filter_fn(
         score_min=("score", "min")
     )
 
-    if use_pr_scoring:
-        # PR replay needs zero-spread tasks to survive this gate so they can be
-        # repaired below by replaying a higher-score historical sample.
-        eligible = grp[(grp["cnt"] >= per_task_limit)]
-    else:
-        # eligible = grp[(grp["cnt"] >= per_task_limit) & (grp["mean_reward"].ge(0) & grp["mean_reward"].lt(1))]
-        eligible = grp[(grp["cnt"] >= per_task_limit) & (grp["mean_reward"].ge(0) & grp["mean_reward"].lt(acc_max))]
+    eligible = grp[(grp["cnt"] >= per_task_limit) & (grp["mean_reward"].ge(0) & grp["mean_reward"].lt(acc_max))]
     
     if eligible.empty:
         return []
@@ -155,28 +121,10 @@ def filter_fn(
 
     # 4) mean==0 的组：若全表该 task 有 reward>0，则“替最旧为最新正样本”；否则丢弃该 task
     eps = 1e-12
-    if use_pr_scoring:
-        zero_mean_tasks = eligible.index[(eligible["score_max"] - eligible["score_min"]).abs() <= eps].tolist()
-    else:
-        zero_mean_tasks = eligible.index[(eligible["mean_reward"].abs() <= eps)].tolist()
+    zero_mean_tasks = eligible.index[(eligible["mean_reward"].abs() <= eps)].tolist()
     for tid in zero_mean_tasks:
-        if use_pr_scoring and "process_reward" in d.columns:
-            current_score = base[base["task_id"] == tid]["score"].iloc[0]
-            cand_all = d[d["task_id"] == tid].copy()
-            def _get_score(r):
-                pr_l = combine_process_reward_value(
-                    r.get("process_reward"),
-                    pr_step_weight,
-                    pr_group_weight,
-                    pr_multiply_scores,
-                )
-                s = sum(x for x in pr_l if x != -1)
-                return pd.to_numeric(r['reward'], errors='coerce') + pr_weight * s
-            cand_all["tmp_score"] = cand_all.apply(_get_score, axis=1)
-            cand_all = cand_all[cand_all["tmp_score"] > current_score + eps]
-        else:
-            cand_all_mask = (d["task_id"] == tid) & (pd.to_numeric(d["reward"], errors="coerce") > 0)
-            cand_all = d[cand_all_mask]
+        cand_all_mask = (d["task_id"] == tid) & (pd.to_numeric(d["reward"], errors="coerce") > 0)
+        cand_all = d[cand_all_mask]
         
         if cand_all.empty:
             sel = sel[sel["task_id"] != tid]
@@ -201,13 +149,9 @@ def filter_fn(
 
     kept = []
     for tid, g in sel.groupby("task_id", group_keys=False):
-        if use_pr_scoring:
-            pos_rows = g.loc[g["score"] == g["score"].max()]
-            neg_rows = g.loc[g["score"] == g["score"].min()]
-        else:
-            rnum = pd.to_numeric(g["reward"], errors="coerce")
-            pos_rows = g.loc[rnum > 0]
-            neg_rows = g.loc[rnum == 0]
+        rnum = pd.to_numeric(g["reward"], errors="coerce")
+        pos_rows = g.loc[rnum > 0]
+        neg_rows = g.loc[rnum == 0]
 
         # 若无需裁剪，直接保留（已满足上游条件；无法强制补齐不存在的类别）
         if len(g) <= per_task_limit:

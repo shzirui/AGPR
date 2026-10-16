@@ -286,8 +286,6 @@ class StepwiseTrajectorySplitter:
         else:
             start_step = 0
 
-        return_rewards = self._build_return_rewards(reward, process_rewards)
-
         batch_data = []
         for step_idx in range(start_step, n_steps):
             messages = self._build_step_messages(
@@ -301,11 +299,8 @@ class StepwiseTrajectorySplitter:
             messages.append({"role": "assistant", "content": [_content_text(responses[step_idx])]})
 
             process_reward = None
-            return_reward = None
             if process_rewards is not None and step_idx < len(process_rewards):
                 process_reward = process_rewards[step_idx]
-                if return_rewards is not None and step_idx < len(return_rewards):
-                    return_reward = return_rewards[step_idx]
 
             batch_data.append(
                 (
@@ -315,7 +310,6 @@ class StepwiseTrajectorySplitter:
                     prompt_token_ids[step_idx] if step_idx < len(prompt_token_ids) else torch.tensor([]),
                     response_token_ids[step_idx],
                     process_reward,
-                    return_reward,
                     step_idx,
                 )
             )
@@ -329,7 +323,7 @@ class StepwiseTrajectorySplitter:
 
     def tokenize_from_pt(self, batch_data: list, dataset_id: str, reward: float, dataset_path: str | None = None):
         tokenized_batch_data = []
-        for (messages, task_config, rollout_log_prob, prompt_ids, response_ids, process_reward, return_reward, step_idx) in batch_data:
+        for (messages, task_config, rollout_log_prob, prompt_ids, response_ids, process_reward, step_idx) in batch_data:
             if response_ids is None or response_ids.numel() == 0:
                 print(f"[Qwen3Splitter] empty response token ids for {dataset_id} step {step_idx}; skip.")
                 continue
@@ -374,17 +368,13 @@ class StepwiseTrajectorySplitter:
                 "uid": task_config["id"],
                 "rollout_log_probs": rollout_log_prob[0],
                 "step_idx": step_idx,
+                "pr_step_idx": int(step_idx),
             }
 
-            if process_reward is not None:
-                process_reward_tensor = torch.zeros_like(response[0], dtype=torch.float32)
-                process_reward_tensor[valid_response_length - 1] = reward if process_reward == -1 else reward + 0.5 * (process_reward - 0.5)
-                row_dict["process_reward_tensor"] = process_reward_tensor
-
-            if return_reward is not None and process_reward != -1:
-                return_reward_tensor = torch.zeros_like(response[0], dtype=torch.float32)
-                return_reward_tensor[valid_response_length - 1] = return_reward
-                row_dict["return_reward_tensor"] = return_reward_tensor
+            try:
+                row_dict["raw_process_reward"] = float(process_reward)
+            except (TypeError, ValueError):
+                row_dict["raw_process_reward"] = -1.0
 
             self.compute_mask(row_dict)
             tokenized_batch_data.append(row_dict)
@@ -501,21 +491,6 @@ class StepwiseTrajectorySplitter:
 
     def _compact_previous_action(self, response: str) -> str:
         return self._extract_action_line(response) or re.sub(r"<think>.*?</think>", "", response or "", flags=re.DOTALL | re.IGNORECASE).strip()
-
-    def _build_return_rewards(self, reward: float, process_rewards: torch.Tensor | None):
-        if process_rewards is None:
-            return None
-        pr_baseline = 0.5
-        or_scale = 10.0
-        gamma = 0.99
-        returns = [0.0] * len(process_rewards)
-        future_return = 0.0
-        for t in reversed(range(len(process_rewards))):
-            or_val = reward if t == len(process_rewards) - 1 else 0.0
-            r_t = (process_rewards[t] - pr_baseline) + (or_val * or_scale)
-            future_return = r_t + gamma * future_return
-            returns[t] = future_return
-        return returns
 
     def _locate_context(self, messages: list[dict]):
         return len(messages) - 1

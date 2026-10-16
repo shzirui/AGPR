@@ -195,11 +195,7 @@ class OSWorldAsyncDataset(IterableDataset):
         self._last_used_task_id = None
         self._replay_run_cursor = 0
 
-        self.use_pr = str(config.get("use_pr", "none"))
-        self.use_pr_filter = self._as_bool(config.get("use_pr_filter", False))
-        self.pr_step_weight = float(config.get("pr_step_weight", 0.5))
-        self.pr_group_weight = float(config.get("pr_group_weight", 0.5))
-        self.pr_multiply_scores = self._as_bool(config.get("pr_multiply_scores", False))
+        self.use_pr = self._use_pr(config.get("use_pr", True))
 
     # 你原来的 messages 组装逻辑（若仍需要）
     def _build_messages(self, example: dict):
@@ -234,6 +230,19 @@ class OSWorldAsyncDataset(IterableDataset):
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
+
+    @staticmethod
+    def _use_pr(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return int(value) != 0
+        text = str(value).strip().lower()
+        if text in {"true", "yes", "on", "1", "3"}:
+            return True
+        if text in {"false", "no", "off", "0", "none", ""}:
+            return False
+        raise ValueError(f"Unsupported data.use_pr={value!r}; expected true or false")
 
     @staticmethod
     def _normalize_replay_run_ids(value) -> List[str]:
@@ -469,13 +478,8 @@ class OSWorldAsyncDataset(IterableDataset):
 
         process_reward = row_dict.get("process_reward", None) 
 
-        if process_reward and self.use_pr != "none":
-            process_reward = combine_process_reward_value(
-                process_reward,
-                self.pr_step_weight,
-                self.pr_group_weight,
-                self.pr_multiply_scores,
-            )
+        if process_reward and self.use_pr:
+            process_reward = combine_process_reward_value(process_reward)
             sample["process_reward_tensors"] = process_reward
 
         return sample
@@ -513,11 +517,6 @@ class OSWorldAsyncDataset(IterableDataset):
                 top_mvs=top_mvs,
                 random_state=self.config.get("random_state", None),
                 acc_max=self.config.get("acc_max", 1.0),
-                use_pr=self.use_pr,
-                use_pr_filter=self.use_pr_filter,
-                pr_step_weight=self.pr_step_weight,
-                pr_group_weight=self.pr_group_weight,
-                pr_multiply_scores=self.pr_multiply_scores,
             )
             # datasets = data
             print("len datasets filtered for this step:", len(datasets))

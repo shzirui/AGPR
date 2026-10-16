@@ -283,34 +283,13 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
     return data
 
 
-def compute_advantage_step(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, config=None):
-        
-    grpo_calculation_mask = data.batch.get("response_mask_eff", data.batch["response_mask"])
-    if multi_turn:
-        response_length = grpo_calculation_mask.size(1)
-        grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]
-        
-    step_indices = data.non_tensor_batch.get("step_idx", None)
-    advantages, returns = core_algos.compute_stepwise_grpo_advantage(
-        token_level_rewards=data.batch["token_level_rewards"],
-        response_mask=grpo_calculation_mask,
-        uid_index=data.non_tensor_batch["uid"],
-        step_indices=step_indices,
-        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-    )
-    data.batch["advantages"] = advantages
-    data.batch["returns"] = returns
-    
-    return data
-
-
 def compute_process_outcome_advantage(
     data: DataProto,
     outcome_rewards: torch.Tensor,
     process_weight: float = 0.5,
     multi_turn: bool = False,
 ):
-    """Compute process-outcome advantages for PR mode 3."""
+    """Compute process-outcome advantages when use_pr is enabled."""
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
 
@@ -326,7 +305,7 @@ def compute_process_outcome_advantage(
         if key not in data.batch and key not in data.non_tensor_batch
     ]
     if missing:
-        raise ValueError(f"use_pr=3 requires split trajectory fields: {missing}")
+        raise ValueError(f"use_pr=true requires split trajectory fields: {missing}")
 
     raw_process_rewards = np.asarray(data.non_tensor_batch["raw_process_reward"], dtype=np.float32)
     process_rewards = torch.as_tensor(
@@ -335,50 +314,6 @@ def compute_process_outcome_advantage(
         dtype=torch.float32,
     )
     advantages, returns = core_algos.compute_process_outcome_group_advantage(
-        outcome_rewards=outcome_rewards,
-        process_rewards=process_rewards,
-        response_mask=response_mask,
-        uid_index=data.non_tensor_batch["uid"],
-        trajectory_index=data.non_tensor_batch["dataset_ids"],
-        step_index=data.non_tensor_batch["pr_step_idx"],
-        process_weight=process_weight,
-    )
-    data.batch["advantages"] = advantages
-    data.batch["returns"] = returns
-    return data
-
-
-def compute_joint_process_outcome_advantage(
-    data: DataProto,
-    outcome_rewards: torch.Tensor,
-    process_weight: float = 0.3,
-    multi_turn: bool = False,
-):
-    """Compute jointly normalized process-outcome advantages for PR mode 4."""
-    if "response_mask" not in data.batch.keys():
-        data.batch["response_mask"] = compute_response_mask(data)
-
-    response_mask = data.batch.get("response_mask_eff", data.batch["response_mask"])
-    if multi_turn:
-        response_length = response_mask.size(1)
-        response_mask = data.batch["loss_mask"][:, -response_length:]
-
-    required_fields = ("raw_process_reward", "uid", "dataset_ids", "pr_step_idx")
-    missing = [
-        key
-        for key in required_fields
-        if key not in data.batch and key not in data.non_tensor_batch
-    ]
-    if missing:
-        raise ValueError(f"use_pr=4 requires split trajectory fields: {missing}")
-
-    raw_process_rewards = np.asarray(data.non_tensor_batch["raw_process_reward"], dtype=np.float32)
-    process_rewards = torch.as_tensor(
-        raw_process_rewards,
-        device=outcome_rewards.device,
-        dtype=torch.float32,
-    )
-    advantages, returns = core_algos.compute_joint_process_outcome_group_advantage(
         outcome_rewards=outcome_rewards,
         process_rewards=process_rewards,
         response_mask=response_mask,

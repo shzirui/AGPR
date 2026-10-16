@@ -5,9 +5,9 @@
 # repository root:
 #   bash examples/osworld/async/debug.sh
 #
-# use_pr=3 is the paper setting: GRPO's outcome advantage plus a standardized
+# use_pr=true is the paper setting: GRPO's outcome advantage plus a standardized
 # process advantage, mixed with pr_adv_weight (alpha in the paper).
-# Set use_pr=none to train outcome-only GRPO.
+# Set use_pr=false to train outcome-only GRPO.
 
 set -euo pipefail
 set -x
@@ -78,15 +78,9 @@ use_vllm_logp=True
 use_sft_loss=False
 use_token_ids_from_pt=True
 
-# none: outcome GRPO. 3: outcome advantage + group process advantage (paper).
-use_pr=3
-use_pr_filter=false
+# true: outcome advantage + group process advantage (paper). false: outcome GRPO.
+use_pr=true
 pr_adv_weight=0.5
-pr_total_weight=0.3
-pr_total_decay=0.99
-pr_step_weight=0.5
-pr_group_weight=0.5
-pr_multiply_scores=true
 
 actor_resume_ckpt_to_keep=1
 
@@ -127,13 +121,7 @@ python3 -m verl.trainer.main_ppo_async \
     +data.train_batch_size_max=${train_bz_max} \
     +data.top_mvs_n=2 \
     +data.use_pr=${use_pr} \
-    +data.use_pr_filter=${use_pr_filter} \
     +data.pr_adv_weight=${pr_adv_weight} \
-    +data.pr_total_weight=${pr_total_weight} \
-    +data.pr_total_decay=${pr_total_decay} \
-    +data.pr_step_weight=${pr_step_weight} \
-    +data.pr_group_weight=${pr_group_weight} \
-    +data.pr_multiply_scores=${pr_multiply_scores} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     reward_model.reward_manager=osworld \

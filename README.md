@@ -20,15 +20,14 @@ Process rewards are produced while rollouts are collected, then consumed by the 
 * The trainer reads those scores in `verl/trainer/ppo/ray_trainer_async.py`.
 * The training entry is `examples/osworld/async/debug.sh`.
 
-`use_pr=3` is the setting used in the paper: keep GRPO's outcome advantage and add a process advantage standardized over the sampled group.
+`use_pr=true` is the setting used in the paper: keep GRPO's outcome advantage and add a process advantage standardized over the sampled group. Action scores are multiplied by the refined group score.
 
 ```bash
-use_pr=3
+use_pr=true
 pr_adv_weight=0.5          # alpha in the paper
-pr_multiply_scores=true    # action score x refined group score
 ```
 
-Set `use_pr=none` for outcome-only GRPO. `pr_adv_weight` is the coefficient on the process advantage.
+Set `use_pr=false` for outcome-only GRPO. `pr_adv_weight` is the coefficient on the process advantage.
 
 ## Quick start
 

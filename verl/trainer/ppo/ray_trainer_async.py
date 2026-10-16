@@ -41,9 +41,8 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
 )
-from verl.trainer.ppo.ray_trainer import RayOSWorldTrainer, ResourcePoolManager, Role, WorkerType, compute_advantage, compute_advantage_step
+from verl.trainer.ppo.ray_trainer import RayOSWorldTrainer, ResourcePoolManager, Role, WorkerType, compute_advantage
 from verl.trainer.ppo.ray_trainer import compute_process_outcome_advantage
-from verl.trainer.ppo.ray_trainer import compute_joint_process_outcome_advantage
 from verl.trainer.ppo.trajectory_splitter import StepwiseTrajectorySplitter
 from verl.utils.debug import marked_timer
 from verl.utils.metric import (
@@ -54,6 +53,20 @@ from verl.utils.database.mysql import create_database_manager
 from verl.utils.database.rollouter_reload_model import reload_model
 
 from verl.trainer.ppo.sample_visualizer import SampleVisualizer, save_batch_for_viz
+
+
+def _use_process_reward(config) -> bool:
+    value = config.data.get("use_pr", True)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) != 0
+    text = str(value).strip().lower()
+    if text in {"true", "yes", "on", "1", "3"}:
+        return True
+    if text in {"false", "no", "off", "0", "none", ""}:
+        return False
+    raise ValueError(f"Unsupported data.use_pr={value!r}; expected true or false")
 
 
 class RayOSWorldAsyncTrainer(RayOSWorldTrainer):
@@ -391,29 +404,11 @@ class RayOSWorldAsyncTrainer(RayOSWorldTrainer):
                         # pengxiang debug
                         batch.batch["token_level_scores"] = reward_tensor
 
-                        PR_MODE = str(self.config.data.use_pr)
-                        pr_source = "outcome_reward"
+                        use_pr = _use_process_reward(self.config)
                         default_score_mean = batch.batch["token_level_scores"].sum(-1).float().mean().item()
-                        
-                        if PR_MODE == "1" and "process_reward_tensor" in batch.batch:
-                            batch.batch["token_level_scores"] = batch.batch["process_reward_tensor"]
-                            pr_source = "process_reward_tensor"
-
-                        if PR_MODE == "2" and "return_reward_tensor" in batch.batch:
-                            batch.batch["token_level_scores"] = batch.batch["return_reward_tensor"]
-                            pr_source = "return_reward_tensor"
-                        elif PR_MODE == "3":
-                            pr_source = "separate_process_outcome_advantages"
-                        elif PR_MODE == "4":
-                            pr_source = "joint_process_outcome_advantages"
-
-                        final_score_mean = batch.batch["token_level_scores"].sum(-1).float().mean().item()
                         print(
-                            f"[PR_DEBUG] mode={PR_MODE}, source={pr_source}, "
-                            f"has_process_reward_tensor={'process_reward_tensor' in batch.batch}, "
-                            f"has_return_reward_tensor={'return_reward_tensor' in batch.batch}, "
-                            f"default_score_mean={default_score_mean:.6f}, "
-                            f"final_score_mean={final_score_mean:.6f}"
+                            f"[PR_DEBUG] use_pr={use_pr}, "
+                            f"default_score_mean={default_score_mean:.6f}"
                         )
 
                         if self.config.reward_model.launch_reward_fn_async:
@@ -433,33 +428,12 @@ class RayOSWorldAsyncTrainer(RayOSWorldTrainer):
 
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
 
-                        if PR_MODE == "3":
+                        if use_pr:
                             batch = compute_process_outcome_advantage(
                                 batch,
                                 outcome_rewards=reward_tensor,
                                 process_weight=float(self.config.data.get("pr_adv_weight", 0.5)),
                                 multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
-                            )
-                        elif PR_MODE == "4":
-                            initial_weight = float(self.config.data.get("pr_total_weight", 0.3))
-                            decay = float(self.config.data.get("pr_total_decay", 0.99))
-                            current_weight = initial_weight * (decay ** epoch)
-                            batch = compute_joint_process_outcome_advantage(
-                                batch,
-                                outcome_rewards=reward_tensor,
-                                process_weight=current_weight,
-                                multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
-                            )
-                        elif PR_MODE == "2" and "return_reward_tensor" in batch.batch:
-                            batch = compute_advantage_step(
-                                batch,
-                                adv_estimator=self.config.algorithm.adv_estimator,
-                                gamma=self.config.algorithm.gamma,
-                                lam=self.config.algorithm.lam,
-                                num_repeat=self.config.actor_rollout_ref.rollout.n,
-                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                                multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
-                                config=self.config.algorithm,
                             )
                         else:
                             batch = compute_advantage(
@@ -472,93 +446,6 @@ class RayOSWorldAsyncTrainer(RayOSWorldTrainer):
                                 multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
                                 config=self.config.algorithm,
                             )
-
-                        # if PR_MODE == "1" and "process_reward_tensor" in batch.batch:
-                        #     PR_ALPHA = 1.5         # 过程分的控制权重 (仅思路1用到)
-                        #     PR_BASELINE = 0.5      # 过程分的及格线
-                            
-                        #     # 1. 取出张量
-                        #     # adv_traj shape: [batch_size, seq_len]
-                        #     # pr_scalar shape: [batch_size, 1] 
-                        #     adv_traj = batch.batch["advantages"]  
-                        #     pr_scalar = batch.batch["process_reward_tensor"]  
-
-                        #     # 2. 广播相加 (PyTorch 魔法：[B, 1] 加到 [B, S] 上，所有 Token 同享此步骤的补偿)
-                        #     adv_fused = adv_traj + PR_ALPHA * (pr_scalar - PR_BASELINE)
-
-                        #     # 3. 获取有效的 Token Mask (Verl 在生成时用 response_mask 标记有用 token)
-                        #     valid_mask = batch.batch["response_mask"].bool()
-
-                        #     # 4. 提取有效部分的 advantage 进行全局重归一化 (防 KL 发散)
-                        #     valid_advs = adv_fused[valid_mask]
-                            
-                        #     if valid_advs.numel() > 1: # 保护性检查
-                        #         adv_mean = valid_advs.mean()
-                        #         adv_std = valid_advs.std() + 1e-8
-                        #         # 用规范化后的优势覆盖回 batch
-                        #         batch.batch["advantages"] = (adv_fused - adv_mean) / adv_std
-                        #     else:
-                        #         batch.batch["advantages"] = adv_fused
-                                
-                        #     # (可选) 记录一下干预后的指标，方便在 Wandb 里观察
-                        #     metrics.update({
-                        #         "training/pr_adv_mean_before_norm": adv_mean.item() if valid_advs.numel() > 1 else 0.0,
-                        #         "training/pr_intervention_applied": 1.0
-                        #     })
-
-                        # if PR_MODE == "2" and "return_reward_tensor" in batch.batch:
-                        #     from collections import defaultdict
-                            
-                        #     # 1. 提取标量 Dense Return
-                        #     # 因为 return_reward_tensor 只有末尾非零，直接 sum(-1) 就是这个切片的 Return
-                        #     returns = batch.batch["return_reward_tensor"].sum(dim=-1) # Shape: [B]
-                            
-                        #     dataset_ids = batch.non_tensor_batch["dataset_ids"]
-                        #     uids = batch.non_tensor_batch["uid"]
-                        #     B = returns.shape[0]
-                            
-                        #     # 2. 动态推导步数索引 (Step Indices)
-                        #     # 因为 Splitter 是按时间顺序 append 的，同一个 dataset_id 第几次出现就是第几步
-                        #     did_to_steps = defaultdict(int)
-                        #     step_indices_list = []
-                        #     for did in dataset_ids:
-                        #         step_indices_list.append(did_to_steps[did])
-                        #         did_to_steps[did] += 1
-                        #     step_indices = torch.tensor(step_indices_list, device=returns.device) # Shape: [B]
-                            
-                        #     adv_scalars = torch.zeros(B, device=returns.device, dtype=torch.float32)
-                            
-                        #     # 3. 按任务(Task) 和 步数(Step) 严格分组算优势
-                        #     unique_uids = set(uids)
-                        #     for uid in unique_uids:
-                        #         # 找出同属一个 prompt/task 的样本位置
-                        #         uid_mask = [i for i, x in enumerate(uids) if x == uid]
-                                
-                        #         # 按 step_idx 二次分组
-                        #         step_to_idxs = defaultdict(list)
-                        #         for idx in uid_mask:
-                        #             step_to_idxs[step_indices[idx].item()].append(idx)
-                                    
-                        #         # 同级较量！(Step 0 只跟 Step 0 比，Step 1 只跟 Step 1 比)
-                        #         for step, idxs in step_to_idxs.items():
-                        #             step_tensor_idxs = torch.tensor(idxs, device=returns.device)
-                        #             step_returns = returns[step_tensor_idxs]
-                                    
-                        #             if len(step_returns) > 1:
-                        #                 # 大于 1 条轨迹，计算均值方差
-                        #                 mean_r = step_returns.mean()
-                        #                 std_r = step_returns.std() + 1e-8
-                        #                 step_adv = (step_returns - mean_r) / std_r
-                        #             else:
-                        #                 # 如果只有 1 条轨迹活到了这步，发免死金牌 (Advantage=0)
-                        #                 step_adv = torch.zeros_like(step_returns)
-                                        
-                        #             adv_scalars[step_tensor_idxs] = step_adv
-
-                        #     # 4. 广播给 Token，并强行覆盖原生的 advantages
-                        #     response_mask = batch.batch["response_mask"].float()
-                        #     batch.batch["advantages"] = response_mask * adv_scalars.unsqueeze(-1)
-                        #     print(f"[PRM] Applied Approach 2: Step-wise GRPO Advantage Computation completed.")
 
                         # update advantage
                         if self.use_padding_mask:
